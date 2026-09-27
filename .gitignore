@@ -1,0 +1,15 @@
+# Velká surová data (limit GitHubu je 100 MB na soubor) – stáhnout ze zdrojů:
+#   kriminalita: https://kriminalita.policie.gov.cz (sekce Ke stažení)
+#   GHSL: https://human-settlement.emergency.copernicus.eu (GHS_BUILT_S)
+kriminalita_geojson/
+ghsl/
+
+# Mezivýsledky notebooků (přegenerují se při spuštění)
+cache/
+figure/
+
+# R / macOS
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store

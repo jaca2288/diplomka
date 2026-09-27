@@ -1,0 +1,1185 @@
+---
+title: "panel_fe_mem"
+output: html_document
+date: "2026-03-15"
+---
+
+## 0. Packages
+
+```{r message=FALSE, warning=FALSE}
+# install.packages(c(
+#   "sf", "terra", "osmdata", "dplyr", "sfnetworks", "tidygraph",
+#   "MASS", "ggplot2", "tidyterra", "lubridate", "tidyr", "fixest",
+#   "h3jsr", "spdep", "spatialreg", "purrr"
+# ))
+
+library(modelsummary)
+library(stringr)
+library(purrr)
+library(pscl)
+library(sf)
+library(terra)
+library(osmdata)
+library(dplyr)
+library(sfnetworks)
+library(tidygraph)
+library(MASS)
+library(ggplot2)
+library(tidyterra)
+library(lubridate)
+library(tidyr)
+library(fixest)
+library(h3jsr)
+library(spdep)
+library(spatialreg)
+library(purrr)
+```
+
+
+## 1. Files and input data
+
+```{r}
+GHSL_FILE  <- "/Users/jachym.bielesz/diplomka/ghsl/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif"
+CRIME_FILE <- "/Users/jachym.bielesz/diplomka/kriminalita_geojson/crimes_prague.geojson"
+
+r <- rast(GHSL_FILE)
+names(r) <- "ghsl"
+
+crimes <- st_read(CRIME_FILE, quiet = TRUE)
+
+if (is.na(st_crs(crimes))) {
+  st_crs(crimes) <- 4326
+}
+```
+
+## 2. Crime time variables
+
+```{r}
+crimes <- crimes |>
+  mutate(
+    crime_time = ymd_hms(date),
+    year       = year(crime_time),
+    month      = month(crime_time),
+    year_month = floor_date(crime_time, "month")
+  ) |>
+  filter(!is.na(year), !is.na(month))
+```
+
+## 3. Prague boundary
+
+```{r}
+prague_poly <- getbb("Praha, Czech Republic", format_out = "polygon")
+
+prague <- st_sfc(
+  lapply(prague_poly, function(feature) {
+    coords <- as.matrix(feature[[1]])
+    storage.mode(coords) <- "double"
+    st_polygon(list(coords))
+  }),
+  crs = 4326
+) |>
+  st_as_sf() |>
+  summarise() |>
+  st_make_valid()
+
+prague_wgs <- st_transform(prague, 4326)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = prague_wgs, fill = "lightblue", color = "black", alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "Prague boundary")
+```
+
+## 4. Filter crimes to Prague
+
+```{r}
+crimes_clean <- crimes |>
+  mutate(
+    types_list = str_split(types, ";"),
+  )
+
+crimes_clean$types_list <- lapply(crimes_clean$types_list, as.numeric)
+```
+
+
+```{r}
+crimes_prague <- st_intersection(crimes_clean, prague_wgs) |>
+  filter(year > 2021) #|>
+  #filter(map_lgl(types_list, ~ any(.x >= 300 & .x < 400, na.rm = TRUE))) # sexualni zlociny
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = prague_wgs, fill = NA, color = "grey60", linewidth = 0.4) +
+  geom_sf(
+    data = crimes_prague,
+    color = "red", size = 0.4, alpha = 0.4
+  ) +
+  theme_void() +
+  labs(title = "Recorded crimes in Prague, 2020")
+```
+
+## 5. H3 grid over Prague
+
+```{r}
+res_h3 <- 8
+
+h3_ids <- polygon_to_cells(prague_wgs, res = res_h3, simple = TRUE)
+h3_ids <- h3_ids[!is.na(h3_ids)]
+
+hex_sf <- cell_to_polygon(h3_ids, simple = FALSE) |>
+  mutate(id = seq_len(n()))
+
+hex_54009 <- st_transform(hex_sf, crs(r))
+crimes_54009 <- st_transform(crimes_prague, crs(r))
+```
+
+```{r}
+## Map of H3 grid over Prague
+
+grid_plot <- st_transform(hex_sf, st_crs(prague_wgs))
+
+ggplot() +
+  geom_sf(data = grid_plot,
+          fill = NA,
+          color = "steelblue",
+          linewidth = 0.2) +
+  geom_sf(data = prague_wgs,
+          fill = NA,
+          color = "black",
+          linewidth = 0.6) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  labs(title = paste("H3 grid over Prague (resolution =", res_h3, ")"))
+```
+
+
+## 6. Crime counts per cell and year
+
+```{r}
+join_crime <- st_join(crimes_54009, hex_54009, join = st_within)
+
+crime_counts_month <- join_crime |>
+  st_drop_geometry() |>
+  group_by(id = id.y, year, month) |>
+  summarise(crime_count = n(), .groups = "drop")
+
+ids <- hex_54009$id
+
+time_index <- crimes_54009 |>
+  st_drop_geometry() |>
+  distinct(year, month) |>
+  arrange(year, month)
+
+grid_time_panel <- expand_grid(
+  id = ids,
+  time_index
+)
+
+crime_counts_month <- grid_time_panel |>
+  left_join(crime_counts_month, by = c("id", "year", "month")) |>
+  mutate(crime_count = replace_na(crime_count, 0L))
+
+grid_crime <- hex_54009 |>
+  left_join(crime_counts_month, by = "id") |>
+  mutate(crime_count = replace_na(crime_count, 0L))
+```
+
+## 7. GHSL built-up intensity and WORLDPOP population
+
+```{r}
+vals <- terra::extract(r, vect(grid_crime), fun = mean, na.rm = TRUE)
+grid_crime$ghsl_mean <- vals$ghsl
+```
+
+```{r}
+POP_FILE <- "/Users/jachym.bielesz/diplomka/worldpop/cze_pop_2015_CN_100m_R2025A_v1.tif"
+
+pop_r <- rast(POP_FILE)
+names(pop_r) <- "population"
+
+hex_pop_crs <- st_transform(hex_54009, crs(pop_r))
+
+pop_vals <- terra::extract(
+  pop_r,
+  vect(hex_pop_crs),
+  fun = sum,
+  na.rm = TRUE
+)
+
+hex_population <- hex_54009 |>
+  mutate(
+    population = pop_vals$population,
+    population = replace_na(population, 0)
+  )
+
+population_vars <- hex_population |>
+  st_drop_geometry() |>
+  select(id, population)
+```
+
+
+
+## 8. Street network from OSM
+
+```{r}
+bb <- st_bbox(prague_wgs)
+
+car_highways <- c(
+  "motorway", "trunk", "primary", "secondary", "tertiary",
+  "motorway_link", "trunk_link", "primary_link",
+  "secondary_link", "tertiary_link", "residential"
+)
+
+q_streets <- opq(bbox = bb) |>
+  add_osm_feature(key = "highway", value = car_highways)
+
+osm <- osmdata_sf(q_streets)
+streets_raw <- osm$osm_lines
+rm(osm); gc()
+```
+
+```{r}
+streets_prague <- streets_raw |>
+  st_make_valid()
+```
+
+```{r}
+streets_clean <- streets_prague |>
+  filter(st_geometry_type(geometry) %in% c("LINESTRING", "MULTILINESTRING")) |>
+  st_cast("LINESTRING") |>
+  filter(!st_is_empty(geometry))
+```
+
+## 9. Street network centrality
+
+```{r}
+net_prague <- as_sfnetwork(
+  streets_clean,
+  directed = FALSE,
+  edges_as_lines = TRUE
+)
+
+net_prague_m <- st_transform(net_prague, 3857)
+
+net_prague_m <- net_prague_m |>
+  activate(nodes) |>
+  mutate(
+    deg  = centrality_degree(mode = "all"),
+    betw = centrality_betweenness(),
+    clos = centrality_closeness(),
+    eig  = centrality_eigen()
+  )
+
+nodes_sf <- st_as_sf(net_prague_m, "nodes")
+```
+
+## 10. Aggregate centralities to grid
+
+```{r}
+grid_3857 <- st_transform(grid_crime, 3857)
+
+join_nodes <- st_join(grid_3857, nodes_sf, join = st_contains)
+
+cent_grid_nodes <- join_nodes |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    deg_mean   = ifelse(all(is.na(deg)), 0, mean(deg, na.rm = TRUE)),
+    betw_mean  = ifelse(all(is.na(betw)), 0, mean(betw, na.rm = TRUE)),
+    clos_mean  = ifelse(all(is.na(clos)), 0, mean(clos, na.rm = TRUE)),
+    eig_mean   = ifelse(all(is.na(eig)), 0, mean(eig, na.rm = TRUE)),
+    .groups    = "drop"
+  )
+
+grid_full <- grid_crime |>
+  left_join(cent_grid_nodes, by = "id")
+```
+
+## 11. Metro stations
+
+```{r}
+q_metro <- opq(bbox = bb) |>
+  add_osm_feature(key = "railway", value = c("station", "halt", "subway_entrance"))
+
+osm_metro <- osmdata_sf(q_metro)
+metro_pts <- osm_metro$osm_points |>
+  st_make_valid()
+
+metro_54009 <- st_transform(metro_pts, crs(grid_crime))
+
+join_metro <- st_join(
+  grid_crime,
+  metro_54009,
+  join = st_is_within_distance,
+  dist = 500
+)
+
+metro_grid <- join_metro |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    has_metro_500 = as.integer(any(!is.na(osm_id))),
+    .groups = "drop"
+  )
+```
+
+## 12. Pubs, bars, restaurants, cafés
+
+```{r}
+q_pubs <- opq(bbox = bb) |>
+  add_osm_feature(
+    key = "amenity",
+    value = c("pub", "bar", "restaurant", "cafe")
+  )
+
+osm_pubs <- osmdata_sf(q_pubs)
+pub_pts <- osm_pubs$osm_points |>
+  st_make_valid()
+
+pubs_54009 <- st_transform(pub_pts, crs(grid_crime))
+
+join_pubs <- st_join(
+  grid_crime,
+  pubs_54009,
+  join = st_is_within_distance,
+  dist = 500
+)
+
+pubs_grid <- join_pubs |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    n_pubs_500 = sum(!is.na(osm_id)),
+    .groups = "drop"
+  )
+```
+
+## 13. Merge static regressors
+
+```{r}
+grid_full <- grid_full |>
+  left_join(pubs_grid,  by = "id") |>
+  left_join(metro_grid, by = "id")
+ grid_full <- grid_full %>% mutate(
+    has_metro_500 = ifelse(is.na(has_metro_500), 0L, has_metro_500),
+    n_pubs_500    = ifelse(is.na(n_pubs_500), 0L, n_pubs_500)
+  )
+
+static_vars <- grid_full |>
+  st_drop_geometry() |>
+  select(
+    id,
+    ghsl_mean,
+    betw_mean,
+    clos_mean,
+    n_pubs_500,
+    has_metro_500,
+    eig_mean,
+    deg_mean
+  ) |>
+  left_join(population_vars, by = "id") |>
+  mutate(
+    population = replace_na(population, 0),
+    pop_offset = log(population + 1)
+  )
+```
+
+## 14. Prepare panel data
+
+```{r}
+ids <- sort(unique(static_vars$id))
+
+time_index <- crime_counts_month |>
+  distinct(year, month) |>
+  arrange(year, month)
+
+panel_base <- expand_grid(
+  id = ids,
+  time_index
+)
+
+static_vars <- distinct(static_vars)
+
+panel_df <- panel_base |>
+  left_join(crime_counts_month, by = c("id", "year", "month")) |>
+  mutate(crime_count = replace_na(crime_count, 0L)) |>
+  left_join(static_vars, by = "id")
+
+panel_df_model <- panel_df
+```
+
+```{r}
+panel_df_model <- panel_df #|>
+#  filter(
+#    !is.na(ghsl_mean),
+#    !is.na(betw_mean),
+#    !is.na(clos_mean),
+#    !is.na(n_pubs_500),
+#    !is.na(eig_mean),
+#    !is.na(deg_mean),
+#    !is.na(has_metro_500)
+#  )
+```
+
+## 15. Basic diagnostics
+
+```{r}
+mean(panel_df_model$crime_count)
+var(panel_df_model$crime_count)
+mean(panel_df_model$crime_count == 0)
+```
+
+## 16. Spatial weights for MEM
+
+```{r}
+grid_mem <- grid_full |>
+  select(id) |>
+  distinct() |>
+  arrange(id)
+
+nb <- poly2nb(grid_mem, queen = TRUE)
+table(card(nb))
+
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+```
+
+
+## 17. Cross-section for MEM selection
+
+```{r}
+mem_select_df <- panel_df_model |>
+  group_by(id) |>
+  summarise(
+    crime_avg      = mean(crime_count, na.rm = TRUE),
+    ghsl_mean      = first(ghsl_mean),
+    betw_mean      = first(betw_mean),
+    clos_mean      = first(clos_mean),
+    n_pubs_500     = first(n_pubs_500),
+    has_metro_500  = first(has_metro_500),
+    eig_mean       = first(eig_mean),
+    deg_mean       = first(deg_mean),
+    population     = first(population),
+    pop_offset     = first(pop_offset),
+    .groups        = "drop"
+  ) |>
+  arrange(id)
+
+stopifnot(all(mem_select_df$id == grid_mem$id))
+```
+
+
+## 18. Select MEM eigenvectors
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# run MEM selection
+#me_obj <- ME(
+#  crime_avg ~ 1,
+#  data = mem_select_df,
+#  listw = lw,
+#  family = poisson(link = "log"),
+#  alpha = 0.05
+#)
+
+```
+
+## 19. Add MEM variables to panel
+
+
+
+```{r}
+#if (is.null(me_obj$vectors) || ncol(as.data.frame(me_obj$vectors)) == 0) {
+#  mem_vars_df <- mem_select_df |>
+#    select(id)
+#} else {
+#  mem_mat <- as.data.frame(me_obj$vectors)
+#  names(mem_mat) <- paste0("mem_", seq_len(ncol(mem_mat)))
+#
+#  mem_vars_df <- bind_cols(
+#    mem_select_df |> select(id),
+#    mem_mat
+#  )
+#}
+#
+#panel_df_mem <- panel_df_model |>
+#  left_join(mem_vars_df, by = "id")
+
+#mem_names <- names(panel_df_mem)[grepl("^mem_", names(panel_df_mem))]
+#mem_names
+```
+
+```{r}
+## 1️⃣ Agregace (SUM místo mean)
+mem_select_df <- panel_df_model |>
+  group_by(id) |>
+  summarise(
+    crime_sum = sum(crime_count, na.rm = TRUE),
+    ghsl_mean = first(ghsl_mean),
+    betw_mean = first(betw_mean),
+    clos_mean = first(clos_mean),
+    n_pubs_500 = first(n_pubs_500),
+    has_metro_500 = first(has_metro_500),
+    eig_mean = first(eig_mean),
+    deg_mean = first(deg_mean),
+    .groups = "drop"
+  )
+
+## 2️⃣ Odstranit izolované buňky
+keep <- card(nb) > 0
+
+mem_select_df_sub <- mem_select_df[keep, ]
+nb_sub <- subset(nb, subset = keep)
+lw_sub <- nb2listw(nb_sub, style = "W", zero.policy = TRUE)
+
+## 3️⃣ MEM selection
+me_obj <- ME(
+  crime_sum ~ 1,
+  data = mem_select_df_sub,
+  listw = lw_sub,
+  family = poisson(link = "log"),
+  alpha = 0.05
+)
+
+## 4️⃣ Vytvořit MEM proměnné
+if (is.null(me_obj$vectors) || ncol(as.data.frame(me_obj$vectors)) == 0) {
+  
+  mem_vars_df <- mem_select_df_sub |>
+    select(id)
+  
+} else {
+  
+  mem_mat <- as.data.frame(me_obj$vectors)
+  names(mem_mat) <- paste0("mem_", seq_len(ncol(mem_mat)))
+
+  mem_vars_df <- mem_select_df_sub |>
+    select(id) |>
+    bind_cols(mem_mat)
+}
+
+## 5️⃣ Napojení zpět na panel
+panel_df_mem <- panel_df_model |>
+  left_join(mem_vars_df, by = "id")
+
+## 6️⃣ Nahradit NA nulou
+mem_names <- names(panel_df_mem)[grepl("^mem_", names(panel_df_mem))]
+
+if (length(mem_names) > 0) {
+  panel_df_mem <- panel_df_mem |>
+    mutate(across(all_of(mem_names), ~ replace_na(., 0)))
+}
+
+mem_names
+```
+
+```{r}
+panel_df_mem <- panel_df_mem |>
+  mutate(
+    population = replace_na(population, 0),
+    pop_offset = log(population + 1)
+  )
+```
+
+```{r}
+train_df_mem <- panel_df_mem |> filter(year < 2025)
+test_df_mem  <- panel_df_mem |> filter(year >= 2025)
+
+train_df_zi <- panel_df_mem |> filter(year < 2025)
+test_df_zi  <- panel_df_mem |> filter(year >= 2025)
+
+train_df_base <- panel_df_model |> filter(year < 2025)
+test_df_base <- panel_df_model |> filter(year >= 2025)
+```
+
+## 20. Baseline negative binomial model
+
+```{r}
+m_nb_base <- fenegbin(
+  crime_count ~ ghsl_mean + clos_mean +
+    n_pubs_500 + has_metro_500 + eig_mean + deg_mean + offset(pop_offset) 
+    | month,
+  data = train_df_base #panel_df_model
+)
+
+summary(m_nb_base)
+
+wald(m_nb_base, "year")
+wald(m_nb_base, "month")
+```
+
+```{r}
+year_fe <- data.frame(
+  year = names(fixef(m_nb_base)$year),
+  effect = as.numeric(fixef(m_nb_base)$year)
+)
+
+month_fe <- data.frame(
+  month = names(fixef(m_nb_base)$month),
+  effect = as.numeric(fixef(m_nb_base)$month)
+)
+
+year_fe
+month_fe
+```
+
+
+```{r}
+ggplot(month_fe, aes(x = as.numeric(month), y = effect)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "Month fixed effects",
+    x = "Month",
+    y = "Estimated fixed effect"
+  )
+```
+
+```{r}
+test_df_base$pred_nb <- predict(
+  m_nb_base,
+  newdata = test_df_base,
+  type = "response"
+)
+```
+
+
+```{r}
+cor_base <- cor(
+  log(test_df_base$crime_count + 1),
+  log(test_df_base$pred_nb + 1),
+  use = "complete.obs"
+)
+cor_base
+```
+
+```{r}
+sqrt(mean(
+  (test_df_base$crime_count - test_df_base$pred_nb)^2,
+  na.rm = TRUE
+))
+```
+
+```{r}
+sqrt(mean(
+  ((test_df_base$crime_count - test_df_base$pred_nb) /
+   (test_df_base$pred_nb + 1))^2,
+  na.rm = TRUE
+))
+```
+
+
+```{r}
+ggplot(test_df_base, aes(x = pred_nb, y = crime_count)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "Out-of-sample prediction",
+    x = "Predicted",
+    y = "Observed"
+  )
+```
+
+
+
+## 21. Negative binomial model with MEM filtering
+
+```{r}
+base_rhs <- c(
+  "ghsl_mean",
+  "betw_mean",
+  "clos_mean",
+  "n_pubs_500",
+  "has_metro_500",
+  "eig_mean",
+  "deg_mean",
+  "offset(pop_offset)"
+)
+
+rhs_all <- c(base_rhs, mem_names)
+
+fml_mem <- as.formula(
+  paste0(
+    "crime_count ~ ",
+    paste(rhs_all, collapse = " + "),
+    " | year + month"
+  )
+)
+
+fml_mem <- as.formula("crime_count ~ ghsl_mean + betw_mean + clos_mean + n_pubs_500 + 
+    has_metro_500 + eig_mean + deg_mean + offset(pop_offset) + mem_1 | year + month")
+
+m_nb_mem <- fenegbin(
+  crime_count ~ ghsl_mean + clos_mean +
+    n_pubs_500 + has_metro_500 + eig_mean + deg_mean + offset(pop_offset) + mem_1 + mem_3 + mem_5 + mem_7 + mem_8 + mem_9 + mem_10 + mem_11 + mem_12 + mem_13 + mem_14 + mem_15 + mem_17 + mem_18 + mem_19
+    | month,
+  data = train_df_mem
+)
+
+summary(m_nb_mem)
+
+modelsummary(
+  m_nb_mem,
+  output = "img/m_nb_mem.tex"
+)
+
+
+```
+
+```{r}
+test_df_mem$pred_nb <- predict(
+  m_nb_mem,
+  newdata = test_df_mem,
+  type = "response"
+)
+```
+
+```{r}
+cor_mem <- cor(
+  log(test_df_mem$crime_count + 1),
+  log(test_df_mem$pred_nb + 1),
+  use = "complete.obs"
+)
+
+cor_mem
+```
+
+
+```{r}
+sqrt(mean(
+  (test_df_mem$crime_count - test_df_mem$pred_nb)^2,
+  na.rm = TRUE
+))
+```
+
+
+```{r}
+sqrt(mean(
+  ((test_df_mem$crime_count - test_df_mem$pred_nb) /
+   (test_df_mem$pred_nb + 1))^2,
+  na.rm = TRUE
+))
+```
+
+
+## 22. Zero inflated model
+
+```{r}
+m_zinb <- zeroinfl(
+  crime_count ~ ghsl_mean + clos_mean + eig_mean +
+    n_pubs_500 + has_metro_500 + deg_mean + mem_1 + mem_3 + mem_5 + mem_7 + mem_8 + mem_9 + mem_10 + mem_11 + mem_12 + mem_13 + mem_14 + mem_15 + mem_17 + mem_18 + mem_19 +
+    factor(year) + factor(month) + offset(pop_offset)
+  |
+    has_metro_500 + population,
+  data = train_df_zi,
+  dist = "negbin"
+)
+
+summary(m_zinb)
+
+modelsummary(
+  m_zinb,
+  output = "img/zinb.tex"
+)
+```
+
+
+```{r}
+AIC(m_nb_mem)
+AIC(m_zinb)
+```
+
+```{r}
+BIC(m_nb_mem)
+BIC(m_zinb)
+```
+
+```{r}
+mean(panel_df_mem$crime_count == 0)
+mean(predict(m_zinb, type = "prob")[, "0"])
+```
+
+
+```{r}
+test_df_zi$pred_nb <- predict(
+  m_nb_base,
+  newdata = test_df_zi,
+  type = "response"
+)
+```
+
+
+```{r}
+cor_zinb <- cor(
+  log(test_df_zi$crime_count + 1),
+  log(test_df_zi$pred_nb + 1),
+  use = "complete.obs"
+)
+
+cor_zinb
+```
+
+```{r}
+sqrt(mean(
+  (test_df_zi$crime_count - test_df_zi$pred_nb)^2,
+  na.rm = TRUE
+))
+```
+
+```{r}
+sqrt(mean(
+  ((test_df_zi$crime_count - test_df_zi$pred_nb) /
+   (test_df_zi$pred_nb + 1))^2,
+  na.rm = TRUE
+))
+```
+
+
+
+
+## 22. Model comparison
+
+```{r}
+etable(m_nb_base, m_nb_mem)
+summary(m_zinb)
+```
+
+## 23. Moran test on residuals
+
+```{r}
+# residuals aligned to original data
+train_df_base$resid_base <- residuals(
+  m_nb_base,
+  type = "pearson",
+  na.rm = FALSE
+)
+
+# average residual by cell
+resid_base_by_id <- train_df_base |>
+  group_by(id) |>
+  summarise(
+    resid_mean = mean(resid_base, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    resid_mean = ifelse(is.nan(resid_mean), NA, resid_mean)
+  ) |>
+  arrange(id)
+
+# keep only non-missing cells
+keep_base <- !is.na(resid_base_by_id$resid_mean)
+
+resid_base_clean <- resid_base_by_id[keep_base, ]
+
+# subset neighbour structure to same cells
+nb_base <- subset(nb, subset = keep_base)
+lw_base <- nb2listw(nb_base, style = "W", zero.policy = TRUE)
+
+# Moran Monte Carlo test
+moran_base <- moran.mc(
+  resid_base_clean$resid_mean,
+  listw = lw_base,
+  nsim = 999,
+  zero.policy = TRUE
+)
+
+moran_base
+```
+
+```{r}
+train_df_mem$resid_mem <- residuals(
+  m_nb_mem,
+  type = "pearson",
+  na.rm = FALSE
+)
+
+resid_mem_by_id <- train_df_mem |>
+  group_by(id) |>
+  summarise(
+    resid_mean = mean(resid_mem, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    resid_mean = ifelse(is.nan(resid_mean), NA, resid_mean)
+  ) |>
+  arrange(id)
+
+keep_mem_res <- !is.na(resid_mem_by_id$resid_mean)
+
+resid_mem_clean <- resid_mem_by_id[keep_mem_res, ]
+
+nb_mem_res <- subset(nb, subset = keep_mem_res)
+lw_mem_res <- nb2listw(nb_mem_res, style = "W", zero.policy = TRUE)
+
+moran_mem <- moran.mc(
+  resid_mem_clean$resid_mean,
+  listw = lw_mem_res,
+  nsim = 999,
+  zero.policy = TRUE
+)
+
+moran_mem
+```
+
+## 24. Predictions
+
+```{r}
+# identify rows used in estimation
+used_mem <- !is.na(residuals(m_nb_mem, type = "pearson", na.rm = FALSE))
+
+# full-length prediction vector
+train_df_mem$pred_nb_mem <- NA_real_
+
+# fill only rows used by the model
+train_df_mem$pred_nb_mem[used_mem] <- predict(m_nb_mem, type = "response")
+```
+
+```{r}
+ggplot(train_df_mem, aes(x = pred_nb_mem, y = crime_count)) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "NB + MEM: observed vs predicted crime",
+    x     = "Predicted crime (log scale)",
+    y     = "Observed crime (log scale)"
+  )
+```
+
+```{r}
+ggplot(train_df_mem %>% filter(!is.na(pred_nb_mem)),
+       aes(x = pred_nb_mem, y = crime_count)) +
+  geom_hex(bins = 50) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  labs(
+    title = "NB + MEM: observed vs predicted crime",
+    x = "Predicted crime (log scale)",
+    y = "Observed crime (log scale)"
+  )
+```
+
+```{r}
+cor(
+  log(train_df_mem$crime_count + 1),
+  log(train_df_mem$pred_nb_mem + 1),
+  use = "complete.obs"
+)
+```
+
+
+```{r}
+sqrt(mean(
+  ((train_df_mem$crime_count - train_df_mem$pred_nb_mem) /
+   (train_df_mem$pred_nb_mem + 1))^2,
+  na.rm = TRUE
+))
+```
+
+
+## 25. Average observed and predicted crime by cell
+
+```{r}
+cell_avg_mem <- train_df_mem |>
+  group_by(id) |>
+  summarise(
+    crime_avg = mean(crime_count, na.rm = TRUE),
+    pred_avg  = mean(pred_nb_mem, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+grid_avg_mem <- grid_full |>
+  left_join(cell_avg_mem, by = "id") |>
+  st_transform(st_crs(prague_wgs))
+```
+
+## 26. Maps
+
+```{r}
+edges_sf <- st_as_sf(net_prague_m, "edges")
+edges_plot <- st_transform(edges_sf, st_crs(prague_wgs))
+```
+
+```{r}
+ggplot(grid_avg_mem %>% filter(crime_avg > 0)) +
+  geom_sf(aes(fill = crime_avg), color = NA) +
+  geom_sf(
+    data = edges_plot,
+    color = "grey40", linewidth = 0.2, alpha = 0.7
+  ) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",
+    name   = "avg crime\n(log10)"
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  labs(title = "Average annual crime counts in Prague")
+```
+
+```{r}
+ggplot(grid_avg_mem %>% filter(pred_avg > 0)) +
+  geom_sf(aes(fill = pred_avg), color = NA) +
+  geom_sf(
+    data = edges_plot,
+    color = "grey40", linewidth = 0.2, alpha = 0.7
+  ) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",
+    name   = "avg predicted\ncrime (log10)"
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  labs(title = "NB + MEM: average predicted crime per H3 cell")
+```
+
+```{r}
+train_df_mem$resid_mem <- residuals(
+  m_nb_mem,
+  type = "pearson",
+  na.rm = FALSE
+)
+
+cell_resid_pearson <- train_df_mem |>
+  group_by(id) |>
+  summarise(
+    resid_pearson_avg = mean(resid_mem, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    resid_pearson_avg = ifelse(is.nan(resid_pearson_avg), NA, resid_pearson_avg)
+  )
+
+grid_resid_pearson <- grid_full |>
+  left_join(cell_resid_pearson, by = "id") |>
+  st_transform(st_crs(prague_wgs))
+
+ggplot(grid_resid_pearson) +
+  geom_sf(aes(fill = resid_pearson_avg), color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.15, alpha = 0.5) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    na.value = "grey90",
+    name = "Avg Pearson\nresidual"
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  labs(title = "Average Pearson residuals by grid cell: NB + MEM")
+```
+
+## 27. Train and test maps
+
+```{r}
+
+cell_avg_test <- test_df_base |>
+  group_by(id) |>
+  summarise(
+    crime_avg = mean(crime_count, na.rm = TRUE),
+    pred_avg  = mean(pred_nb, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+grid_test <- grid_full |>
+  left_join(cell_avg_test, by = "id") |>
+  st_transform(st_crs(prague_wgs))
+
+```
+
+
+```{r}
+ggplot(grid_test %>% filter(crime_avg > 0)) +
+  geom_sf(aes(fill = crime_avg), color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.2, alpha = 0.7) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",
+    name   = "Observed\n(log10)"
+  ) +
+  theme_void() +
+  labs(title = "Observed crime (test set)")
+```
+
+
+```{r}
+ggplot(grid_test %>% filter(pred_avg >= 0)) +
+  geom_sf(aes(fill = pred_avg), color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.2, alpha = 0.7) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",
+    name   = "Predicted\n(log10)"
+  ) +
+  theme_void() +
+  labs(title = "Predicted crime (base NB model)")
+```
+
+
+```{r}
+
+cell_avg_test_mem <- test_df_mem |>
+  group_by(id) |>
+  summarise(
+    crime_avg = mean(crime_count, na.rm = TRUE),
+    pred_avg  = mean(pred_nb, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+grid_test_mem <- grid_full |>
+  left_join(cell_avg_test_mem, by = "id") |>
+  st_transform(st_crs(prague_wgs))
+
+ggplot(grid_test_mem %>% filter(pred_avg > 0)) +
+  geom_sf(aes(fill = pred_avg), color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.2, alpha = 0.7) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",
+    name   = "Predicted\n(log10)"
+  ) +
+  theme_void() +
+  labs(title = "Predicted crime (model with MEM filter)")
+```
+
+```{r}
+cell_avg_test_zi <- test_df_zi |>
+  group_by(id) |>
+  summarise(
+    crime_avg = mean(crime_count, na.rm = TRUE),
+    pred_avg  = mean(pred_nb, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+grid_test_zi <- grid_full |>
+  left_join(cell_avg_test_zi, by = "id") |>
+  st_transform(st_crs(prague_wgs))
+
+ggplot(grid_test_zi %>% filter(pred_avg > 0)) +
+  geom_sf(aes(fill = pred_avg), color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.2, alpha = 0.7) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",
+    name   = "Predicted\n(log10)"
+  ) +
+  theme_void() +
+  labs(title = "Predicted crime (zero inflated model)")
+```
+

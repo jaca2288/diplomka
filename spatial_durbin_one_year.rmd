@@ -1,0 +1,554 @@
+---
+title: "spatial_durbin_one_year"
+output: html_notebook
+---
+
+## 0. Packages
+
+```{r}
+# install.packages(c(
+#   "sf", "terra", "osmdata", "dplyr", "sfnetworks", 
+#   "tidygraph", "MASS", "ggplot2"
+# ))
+
+library(sf)
+library(terra)
+library(osmdata)
+library(dplyr)
+library(sfnetworks)
+library(tidygraph)
+library(MASS)
+library(ggplot2)
+library(tidyterra)
+library(lubridate)
+```
+
+## 1. Load GHSL and crimes
+
+```{r}
+# Your files
+r <- rast("/Users/jachym.bielesz/diplomka/ghsl/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif")
+names(r) <- "ghsl"   # simpler name
+
+CRIME_FILE <- "/Users/jachym.bielesz/diplomka/kriminalita_geojson/crimes_prague.geojson"
+
+# Crimes as sf
+crimes <- st_read(CRIME_FILE)
+
+# Make sure CRS is WGS84 (most GeoJSONs are)
+if (is.na(st_crs(crimes))) {
+  st_crs(crimes) <- 4326
+}
+```
+
+```{r}
+# Add year and keep only 2025 crimes
+crimes_2025 <- crimes |>
+  mutate(
+    crime_time = ymd_hms(date),   # <<< CHANGE THIS COLUMN NAME
+    year       = year(crime_time)
+  ) |>
+  filter(year == 2025)
+```
+
+
+## 2. Get Prague boundary and filter crimes to Prague
+
+```{r}
+# Prague admin boundary from OSM
+prg_query <- opq("Prague, Czechia") |>
+  add_osm_feature(key = "boundary", value = "administrative") |>
+  add_osm_feature(key = "admin_level", value = "8")
+
+prg_osm <- osmdata_sf(prg_query)
+
+prague <- prg_osm$osm_multipolygons |>
+  dplyr::filter(name %in% c("Praha", "Prague")) |>
+  slice(1) |>
+  st_make_valid()
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = prague, fill = "lightblue", color = "black", alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "Prague Administrative Boundary (OSM admin_level = 8)")
+```
+
+```{r}
+prague_wgs <- st_transform(prague, 4326)
+
+# Keep only crimes inside Prague
+crimes_prague <- st_intersection(crimes_2025, prague_wgs)
+```
+
+## 3. Build a grid over Prague (this defines your units i)
+
+Let’s use **500 m** cells (you can change `cellsize`).
+
+We build it in **GHSL CRS (EPSG:54009)** so extracting raster is easy.
+
+```{r}
+# Prague in GHSL CRS
+prague_54009 <- st_transform(prague_wgs, crs(r))
+
+# Grid (500 m cells)
+grid_54009 <- st_make_grid(prague_54009, cellsize = 500, square = TRUE)
+grid_54009 <- st_sf(id = seq_along(grid_54009), geometry = grid_54009)
+
+# Crimes in same CRS
+crimes_54009 <- st_transform(crimes_prague, crs(r))
+```
+
+------------------------------------------------------------------------
+
+## 4. Crime counts per grid cell (Y_i)
+
+```{r}
+# Which grid cell each crime falls into
+join_crime <- st_join(crimes_54009, grid_54009, join = st_within)
+
+# Count crimes per grid cell
+crime_counts <- join_crime |>
+  st_drop_geometry() |>
+  group_by(id.y) |>
+  summarise(crime_count = n(), .groups = "drop")
+
+# Merge counts back to grid
+grid_crime <- grid_54009 |>
+  left_join(crime_counts, by = c("id" = "id.y")) |>
+  mutate(crime_count = ifelse(is.na(crime_count), 0L, crime_count))
+```
+
+------------------------------------------------------------------------
+
+## 5. Extract GHSL built-up per cell (B_i)
+
+We take **mean built-up intensity** in each grid cell.
+
+```{r}
+# terra::extract with polygons
+vals <- terra::extract(r, vect(grid_crime), fun = mean, na.rm = TRUE)
+
+# `vals` has first column ID, second = ghsl mean
+grid_crime$ghsl_mean <- vals$ghsl
+```
+
+------------------------------------------------------------------------
+
+## 6. Compute street network centrality & aggregate per grid
+
+### 6.1 Get Prague streets from OSM
+
+
+```{r}
+
+bb <- st_bbox(prague_wgs)
+
+#car_highways <- c(
+#  "motorway", "trunk", "primary", "secondary", "tertiary",
+#  "motorway_link", "trunk_link", "primary_link",
+#  "secondary_link", "tertiary_link",
+#  "residential"
+#)
+
+car_highways <- c(
+  "footway", "pedestrian", "path", "living_street",
+  "track", "residential", "steps"
+)
+
+
+q_streets <- opq(bbox = bb) |>
+  add_osm_feature(key = "highway", value = car_highways)
+
+osm <- osmdata_sf(q_streets)   # this SHOULD be smaller
+streets_raw <- osm$osm_lines
+rm(osm); gc()
+```
+
+```{r}
+# Clip to Prague and clean geometries
+streets_prague <- streets_raw |> st_make_valid()
+```
+
+### 6.2 Force LINESTRING only (for sfnetwork)
+
+```{r}
+streets_clean <- streets_prague |>
+  filter(st_geometry_type(geometry) %in% c("LINESTRING", "MULTILINESTRING")) |>
+  st_cast("LINESTRING") |>
+  filter(!st_is_empty(geometry))
+```
+
+### 6.3 Build spatial network and centrality
+
+We compute centrality on edges (street segments). Use a metric CRS (Web Mercator, EPSG:3857):
+
+```{r}
+# Build network
+net_prague <- as_sfnetwork(
+  streets_clean,
+  directed = FALSE,
+  edges_as_lines = TRUE
+)
+
+# Project to meters
+net_prague_m <- st_transform(net_prague, 3857)
+
+# Edge centrality
+net_prague_m <- net_prague_m |>
+  activate(edges) |>
+  mutate(
+    betw = centrality_edge_betweenness(),
+    len  = st_length(geometry)
+  )
+
+# Node closeness
+net_prague_m <- net_prague_m |>
+  activate(nodes) |>
+  mutate(clos = centrality_closeness())
+
+# Extract node closeness as a vector
+node_clos <- net_prague_m %>%
+  activate(nodes) %>%
+  pull(clos)
+
+# Push closeness to edges
+net_prague_m <- net_prague_m |>
+  activate(edges) |>
+  mutate(
+    clos_edge = (node_clos[from] + node_clos[to]) / 2
+  )
+```
+
+### 6.4 Aggregate centrality per grid cell
+
+We need the grid in same CRS (3857), then intersect.
+
+```{r}
+## 5) Edges as sf with BOTH centralities ----
+edges_sf <- st_as_sf(net_prague_m, "edges")
+# edges_sf is already in 3857 (same as net_prague_m), no need to reproject again
+
+## 6) Reproject grid to 3857 to match edges ----
+grid_3857 <- st_transform(grid_crime, 3857)
+
+## 7) Join edges to grid cells they intersect ----
+join_cent <- st_join(grid_3857, edges_sf, join = st_intersects)
+
+## 8) Aggregate mean centrality per cell ----
+cent_grid <- join_cent |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    betw_mean = mean(betw/max(betw*20), na.rm = TRUE),
+    clos_mean = mean(clos_edge, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+## 9) Merge centrality back into original grid_crime (54009) 
+grid_full <- grid_crime |>
+  left_join(cent_grid, by = "id")
+```
+
+Now `grid_full` has, for each cell (i):
+
+-   `crime_count` = number of crimes
+-   `ghsl_mean` = mean built-up intensity
+-   `betw_mean` = mean edge betweenness
+-   `clos_mean` = mean node closeness
+
+## Add pubs and metro
+
+```{r}
+## 6.5 Metro stations (within 200 m of cell) ----
+
+bb <- st_bbox(prague_wgs)
+
+# Metro / rail stations (you can refine this if you have better tags)
+q_metro <- opq(bbox = bb) |>
+  add_osm_feature(key = "railway", value = c("station", "halt", "subway_entrance"))
+
+osm_metro <- osmdata_sf(q_metro)
+metro_pts  <- osm_metro$osm_points |> st_make_valid()
+
+# Reproject to GHSL / grid CRS (54009)
+metro_54009 <- st_transform(metro_pts, crs(grid_crime))
+
+# Join: cells with a metro within 200 m
+join_metro <- st_join(
+  grid_crime,
+  metro_54009,
+  join = st_is_within_distance,
+  dist  = 500  # meters
+)
+
+# Aggregate: any metro within 200m?
+metro_grid <- join_metro |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    has_metro_500 = as.integer(any(!is.na(osm_id))),  # 1 if >=1 station
+    .groups = "drop"
+  )
+
+```
+
+
+```{r}
+## 6.6 Pubs / bars (count within 200 m of cell) ----
+
+q_pubs <- opq(bbox = bb) |>
+  add_osm_feature(
+    key   = "amenity",
+    value = c("pub", "bar", "restaurant", "cafe")
+  )
+
+osm_pubs <- osmdata_sf(q_pubs)
+pub_pts  <- osm_pubs$osm_points |> st_make_valid()
+
+pubs_54009 <- st_transform(pub_pts, crs(grid_crime))
+
+join_pubs <- st_join(
+  grid_crime,
+  pubs_54009,
+  join = st_is_within_distance,
+  dist  = 500  # meters
+)
+
+pubs_grid <- join_pubs |>
+  st_drop_geometry() |>
+  group_by(id) |>
+  summarise(
+    n_pubs_500 = sum(!is.na(osm_id)),          # number of pubs/bars/etc within 200m
+    .groups    = "drop"
+  )
+
+```
+
+```{r}
+## 6.7 Attach pubs & metro to grid_full ----
+
+grid_full <- grid_full |>
+  left_join(pubs_grid,  by = "id") |>
+  left_join(metro_grid, by = "id") |>
+  mutate(
+    n_pubs_500    = ifelse(is.na(n_pubs_500), 0L, n_pubs_500),
+    has_metro_500 = ifelse(is.na(has_metro_500), 0L, has_metro_500)
+  )
+
+```
+
+
+
+
+## 7. Prepare data frame for regression
+
+```{r}
+grid_sdm_2025 <- grid_full |>
+  mutate(
+    log_crime = log1p(crime_count),
+    ghsl_s    = as.numeric(scale(ghsl_mean)),
+    betw_s    = as.numeric(scale(betw_mean)),
+    clos_s    = as.numeric(scale(clos_mean)),
+    pubs_s    = as.numeric(scale(n_pubs_500))
+  ) |>
+  filter(!is.na(log_crime), !is.na(ghsl_s), !is.na(betw_s),
+         !is.na(clos_s), !is.na(pubs_s), !is.na(has_metro_500))
+
+df <- grid_full |>
+  st_drop_geometry() |>
+  mutate(
+    crime_any = as.integer(crime_count > 0)
+  )
+```
+
+------------------------------------------------------------------------
+
+## 8. Check distribution & choose model
+
+Quick diagnostics:
+
+```{r}
+mean(df$crime_count)
+var(df$crime_count)
+mean(df$crime_count == 0)  # share of zeros
+```
+
+`var >> mean` → use **Negative Binomial**.
+
+
+## 9. Run models
+
+
+```{r}
+## 9. Spatial Durbin model for 2025 -----------------------------
+
+library(spdep)
+library(spatialreg)
+
+# 9.1 Spatial weights (Queen contiguity on the grid)
+nb_2025 <- poly2nb(grid_sdm_2025)
+lw_2025 <- nb2listw(nb_2025, style = "W", zero.policy = TRUE)
+
+# 9.2 Spatial Durbin Model (Gaussian – classical SDM)
+sdm_2025 <- lagsarlm(
+  log_crime ~ ghsl_s + clos_s + has_metro_500 + n_pubs_500,
+  data  = grid_sdm_2025,
+  listw = lw_2025,
+  type  = "mixed",
+  zero.policy = TRUE
+)
+
+summary(sdm_2025)
+
+```
+
+
+```{r}
+imp_2025 <- impacts(
+  sdm_2025,
+  listw = lw_2025,
+  R = 500,        # bootstrap
+  zstats = TRUE
+)
+
+summary(imp_2025)
+
+```
+
+## Pretty images
+
+```{r}
+
+library(ggplot2)
+library(sf)
+library(dplyr)
+
+# edges in same CRS as Prague outline (WGS84)
+edges_plot <- st_transform(edges_sf, st_crs(prague_wgs))
+
+# optional: log-transform for prettier colour scale
+edges_plot <- edges_plot |>
+  mutate(betw_log = log1p(betw))    # log(1 + betweenness)
+
+ggplot() +
+  geom_sf(data = prague_wgs,
+          fill = NA, color = "grey70", linewidth = 0.4) +
+  geom_sf(data = edges_plot,
+          aes(color = betw_log),
+          linewidth = 0.5, alpha = 0.9) +
+  scale_color_viridis_c(
+    option = "magma",
+    name   = "betweenness\n(log1p)",
+    guide  = guide_colorbar(barheight = unit(3, "cm"))
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(title = "Street betweenness centrality in Prague")
+
+
+```
+
+
+```{r}
+# threshold for "high betweenness" (top 1%)
+thr <- quantile(edges_plot$betw, 0.99, na.rm = TRUE)
+
+edges_top <- edges_plot |>
+  filter(betw >= thr)
+
+ggplot() +
+  geom_sf(data = edges_plot,
+          color = "grey80", linewidth = 0.2) +
+  geom_sf(data = edges_top,
+          color = "red3", linewidth = 1.1) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "Most central streets in Prague (top 1% betweenness)"
+  )
+
+```
+```{r}
+grid_plot <- st_transform(grid_full, st_crs(prague_wgs))
+
+grid_positive <- grid_plot |>
+  filter(crime_count > 0)
+
+ggplot() +
+  geom_sf(data = grid_positive,
+          aes(fill = crime_count),
+          color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.2, alpha = 0.7) +
+  scale_fill_viridis_c(
+    option = "plasma",
+    trans  = "log10",                    # <<< LOG SCALE
+    breaks = c(1, 10, 100, 1000, 10000),
+    name   = "crime count\n(log10)"
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(title = "Crime counts (> 0) in Prague, log scale (500 m grid)")
+
+
+```
+
+```{r}
+# predicted log-crime from SDM
+grid_sdm_2025$pred_log <- as.numeric(predict(sdm_2025))
+
+# back-transform to crime scale: log1p => exp - 1
+grid_sdm_2025$pred_crime <- exp(grid_sdm_2025$pred_log) - 1
+
+```
+
+
+```{r}
+ggplot(grid_sdm_2025, aes(x = pred_crime, y = crime_count)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "SDM 2025: observed vs predicted crime",
+    x     = "Predicted crime (log scale)",
+    y     = "Observed crime (log scale)"
+  )
+
+```
+
+```{r}
+grid_sdm_2025_plot <- st_transform(grid_sdm_2025, st_crs(prague_wgs))
+
+ggplot(grid_sdm_2025_plot |>
+  filter(crime_count > 0)) +
+  geom_sf(aes(fill = pred_crime), color = NA) +
+  geom_sf(data = edges_plot,
+          color = "grey40", linewidth = 0.2, alpha = 0.7) +
+  scale_fill_viridis_c(
+    trans  = "log10",
+    name   = "predicted\ncrime (2025)",
+    option = "plasma",
+    na.value = NA
+  ) +
+  theme_void() +
+  labs(
+    title = "Spatial Durbin model (SDM): predicted crime in 2025"
+  )
+
+```
+

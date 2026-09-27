@@ -1,0 +1,338 @@
+---
+title: "diplomka_testing"
+output: html_document
+date: "2025-11-16"
+---
+
+```{r}
+#install.packages(c("terra", "sf", "rnaturalearth", "spdep", "spatialreg"))
+
+library(terra)
+library(sf)
+library(rnaturalearth)
+library(spdep)
+library(spatialreg)
+```
+
+
+```{r}
+# 1) Your global GHS raster
+r <- rast("/Users/jachym.bielesz/Downloads/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif")
+r
+
+# 2) Get Czech Republic polygon (from Natural Earth)
+cz_sf <- ne_countries(country = "Czechia",
+                      scale = "medium",
+                      returnclass = "sf")
+
+# (if "Czechia" doesn't work for your version, try "Czech Republic")
+# cz_sf <- ne_countries(country = "Czech Republic",
+#                       scale = "medium", returnclass = "sf")
+
+# 3) Reproject CZ to raster's CRS (World Mollweide)
+cz_sf_moll <- st_transform(cz_sf, crs(r))
+
+# 4) Convert to SpatVector (terra)
+cz_v <- vect(cz_sf_moll)
+
+```
+
+```{r}
+# Crop by extent, then mask by country shape
+r_cz <- crop(r, cz_v)
+r_cz <- mask(r_cz, cz_v)
+
+r_cz
+plot(r_cz, main = "GHS Built-up – Czech Republic")
+
+```
+
+```{r}
+# Aggregate: 10 m * 100 = 1000 m ≈ 1 km
+r_cz_agg <- aggregate(r_cz, fact = 100, fun = "mean")
+r_cz_agg
+plot(r_cz_agg, main = "Aggregated built-up (1 km cells)")
+
+```
+
+
+```{r}
+# 1) centroid of CZ in Mollweide
+cz_center <- centroids(cz_v)   # SpatVector point
+
+# 2) distance raster on the aggregated grid
+dist_r <- distance(r_cz_agg)
+
+# 3) centrality = 1 / (1 + distance)
+centrality_r <- 1 / (1 + dist_r)
+
+plot(centrality_r, main = "Centrality: inverse distance to CZ centroid")
+
+```
+
+
+
+## Praha krimi
+
+```{r}
+library(sf)
+library(osmdata)
+library(sfnetworks)
+library(tidygraph)
+library(dplyr)
+library(h3jsr)
+library(spdep)
+library(spatialreg)
+library(ggplot2)
+```
+
+```{r}
+# GHSL raster (global, or large region)
+ghsl <- rast("/Users/jachym.bielesz/Downloads/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif")
+
+```
+
+```{r}
+# Query OSM for the administrative boundary of Prague
+prg_query <- opq("Prague, Czechia") |>
+  add_osm_feature(key = "boundary", value = "administrative") |>
+  add_osm_feature(key = "admin_level", value = "8")  # city-level
+
+prg_osm <- osmdata_sf(prg_query)
+
+# Take the first multipolygon as the city boundary (you can refine if needed)
+prague <- prg_osm$osm_multipolygons |> 
+  slice(1) |>
+  st_make_valid()
+
+st_crs(prague)
+
+```
+
+```{r}
+# Match CRS
+prague_ghsl_crs <- st_transform(prague, crs(ghsl))
+
+# Crop + mask GHSL raster to Prague boundary
+ghsl_prague <- ghsl |>
+  crop(prague_ghsl_crs) |>
+  mask(prague_ghsl_crs)
+
+```
+
+
+
+```{r}
+# Work in WGS84 for the OSM query
+prague_wgs <- st_transform(prague, 4326)
+bb <- st_bbox(prague_wgs)
+
+# Query all highways within Prague bounding box
+q_streets <- opq(bbox = bb) |>
+  add_osm_feature(key = "highway")
+
+osm_streets_all <- osmdata_sf(q_streets)$osm_lines
+
+# Clip streets to exact Prague boundary
+osm_streets_prague <- st_intersection(osm_streets_all, prague_wgs)
+
+```
+
+```{r}
+plot(ghsl_prague, main = "Prague: GHSL + OSM Streets")
+plot(st_geometry(st_transform(osm_streets_prague, crs(ghsl_prague))),
+     add = TRUE, lwd = 0.3)
+
+```
+
+```{r}
+# Convert clipped GHSL raster to data.frame for ggplot
+ghsl_prague_df <- as.data.frame(ghsl_prague, xy = TRUE, na.rm = TRUE)
+names(ghsl_prague_df)[3] <- "value"  # rename raster column
+
+# Make sure streets are in same CRS as raster (reproject to GHSL CRS)
+osm_streets_ghsl <- st_transform(osm_streets_prague, crs(ghsl))
+
+ggplot() +
+  geom_raster(data = ghsl_prague_df,
+              aes(x = x, y = y, fill = value)) +
+  geom_sf(data = osm_streets_ghsl, size = 0.2) +
+  scale_fill_viridis_c(na.value = NA) +
+  coord_sf() +
+  theme_void() +
+  labs(title = "Prague streets over GHSL layer",
+       fill = "GHSL value")
+
+```
+
+
+```{r}
+## 1) Get Prague boundary from OpenStreetMap ----
+prg_query <- opq("Prague, Czechia") |>
+  add_osm_feature(key = "boundary", value = "administrative") |>
+  add_osm_feature(key = "admin_level", value = "8")   # city-level
+
+prg_osm <- osmdata_sf(prg_query)
+
+# Pick the Prague polygon
+prague <- prg_osm$osm_multipolygons |>
+  filter(name %in% c("Praha", "Prague")) |>
+  slice(1) |>
+  st_make_valid()
+
+# Work in WGS84 for OSM queries
+prague_wgs <- st_transform(prague, 4326)
+
+## 2) Get Prague streets (highways) ----
+bb <- st_bbox(prague_wgs)
+
+q_streets <- opq(bbox = bb) |>
+  add_osm_feature(key = "highway")
+
+osm_streets_all <- osmdata_sf(q_streets)$osm_lines
+
+# Clip streets strictly to the Prague polygon
+osm_streets_prague <- st_intersection(osm_streets_all, prague_wgs)
+```
+
+
+```{r}
+## 3) Plot ONLY the street graph ----
+ggplot() +
+  geom_sf(data = osm_streets_prague, linewidth = 0.2) +
+  theme_void() +
+  labs(title = "Street network of Prague (OSM)")
+
+```
+```{r}
+## 1) Prague boundary ----
+prg_query <- opq("Prague, Czechia") |>
+  add_osm_feature(key = "boundary", value = "administrative") |>
+  add_osm_feature(key = "admin_level", value = "8")
+
+prg_osm <- osmdata_sf(prg_query)
+
+prague <- prg_osm$osm_multipolygons |>
+  filter(name %in% c("Praha", "Prague")) |>
+  slice(1) |>
+  st_make_valid()
+
+prague_wgs <- st_transform(prague, 4326)
+
+## 2) Get Prague streets (edges) ----
+bb <- st_bbox(prague_wgs)
+
+q_streets <- opq(bbox = bb) |>
+  add_osm_feature(key = "highway")
+
+osm <- osmdata_sf(q_streets)
+
+streets_raw <- osm$osm_lines
+
+# keep only driving / main roads (optional, to reduce size)
+#car_highways <- c("motorway", "trunk", "primary", "secondary", "tertiary",
+#                  "motorway_link", "trunk_link", "primary_link",
+#                  "secondary_link", "tertiary_link", "residential")
+
+streets <- streets_raw |>
+  filter(highway %in% car_highways)
+
+# clip to Prague
+streets_prague <- st_intersection(streets_raw, prague_wgs)
+
+# clean geometry
+streets_prague <- st_make_valid(streets_prague)
+
+```
+
+
+```{r}
+# make an sfnetwork (edges = lines)
+# 1) drop geometries that are not LINESTRING/MULTILINESTRING
+streets_clean <- streets_prague |> 
+  filter(
+    st_geometry_type(geometry) %in% c("LINESTRING", "MULTILINESTRING")
+  )
+
+# 2) convert MULTILINESTRING → LINESTRING (one row per part)
+streets_clean <- streets_clean |> 
+  st_cast("LINESTRING")
+
+# 3) drop empty geometries if any
+streets_clean <- streets_clean |> 
+  filter(!st_is_empty(geometry))
+
+# 4) now build the network
+net_prague <- as_sfnetwork(
+  streets_clean,
+  directed = FALSE,
+  edges_as_lines = TRUE
+)
+
+net_prague
+
+```
+
+
+```{r}
+# project to a metric CRS so lengths are in meters
+net_prague_m <- st_transform(net_prague, 3857)   # Web Mercator (good enough)
+
+net_prague_m <- net_prague_m |>
+  activate(edges) |>
+  mutate(weight = st_length(geometry))
+
+net_prague_m
+
+```
+
+```{r}
+# degree centrality
+net_prague_m <- net_prague_m |>
+  activate(nodes) |>
+  mutate(deg = centrality_degree())
+
+# quick summary
+net_prague_m %>%
+  activate(nodes) %>%
+  as_tibble() %>%
+  summarise(
+    mean_deg = mean(deg),
+    max_deg  = max(deg),
+    n_nodes  = n()
+  )
+
+```
+
+
+```{r}
+edges_sf <- net_prague_m %>% 
+  activate(edges) %>% 
+  st_as_sf()
+```
+
+
+```{r}
+ggplot() +
+  geom_sf(data = edges_sf, linewidth = 0.2) +
+  theme_void() +
+  labs(title = "Prague street network (geographical)")
+
+```
+
+
+
+
+
+
+```{r}
+CRIME_FILE <- ("/Users/jachym.bielesz/Downloads/202511.geojson")
+
+crime <- st_read(CRIME_FILE)
+
+# Make sure it's point data and in WGS84 for H3
+crime <- st_transform(crime, 4326)
+st_geometry_type(crime)
+st_crs(crime)
+
+```

@@ -1,0 +1,1265 @@
+---
+title: "panel_re_fe_mem"
+output: html_document
+date: "2026-09-26"
+---
+
+Navazuje na `panel_fe_mem.Rmd`. Stejná data a MEM filtr, navíc:
+
+* statické proměnné se počítají **jednou na buňku** (dříve se `n_pubs_500` sčítalo přes všechny měsíce panelu),
+* uliční síť je rozdělena na křižovatkách (`to_spatial_subdivision`) a centrality jsou vážené délkou hran,
+* **prostorová jednotka = anonymizační Voroného polygon policie** (`UNIT = "voronoi"`), H3 mřížka zůstává jako alternativa (`UNIT = "h3"`),
+* rychlý režim `FAST = TRUE` (období 2022–2025, bez nejpomalejších modelů) pro ladění, `FAST = FALSE` pro finální výsledky,
+* neúplný listopad 2025 je vyřazen, panel začíná lednem 2016 a má fixní efekty roku (COVID),
+* standardní chyby jsou clusterované podle buňky (`fixest` jinak clusteruje podle prvního FE, tj. měsíce = 12 clusterů),
+* přibyly modely s **náhodnými efekty buňky** (`glmmTMB`) a s **fixními efekty buňky** (`fenegbin | id`),
+* mezivýsledky se ukládají do `cache/`, takže se 2,6 GB GeoJSON a OSM stahují jen jednou,
+* data jsou omezena na **trestné činy** podle číselníku (bez přestupků), na místo spáchání a bez skutků, které se nestaly,
+* sezónnost: společný měsíční profil, rozdíly sezónnosti podle prostředí a sezónní profily podle kategorií činu.
+
+## 0. Packages
+
+```{r message=FALSE, warning=FALSE}
+# install.packages(c("glmmTMB", "DHARMa"))
+
+library(sf)
+library(terra)
+library(osmdata)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(sfnetworks)
+library(tidygraph)
+library(h3jsr)
+library(spdep)
+library(spatialreg)
+library(fixest)
+library(glmmTMB)
+library(MASS, exclude = "select")
+library(modelsummary)
+library(ggplot2)
+library(jsonlite)
+```
+
+## 1. Settings and cache
+
+```{r}
+setwd("/Users/jachym.bielesz/diplomka")
+
+GHSL_FILE  <- "ghsl/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif"
+POP_FILE   <- "worldpop/cze_pop_2015_CN_100m_R2025A_v1.tif"
+CRIME_FILE <- "kriminalita_geojson/crimes_prague.geojson"
+
+UNIT <- "voronoi"   # "voronoi" = anonymizační polygony policie, "h3" = H3 mřížka
+FAST <- TRUE        # TRUE: rychlý běh na ladění (~15 min), FALSE: finální výsledky (přes hodinu)
+
+# trestné činy jsou v datech v plném rozsahu až od 2016 (2015 jen ~6 tis.)
+YEAR_MIN      <- if (FAST) 2022 else 2016
+RUN_ESF       <- !FAST   # RE-ESF (sekce 10.4) – desítky minut až hodiny
+RUN_SEASON_RS <- !FAST   # náhodné sezónní efekty buněk (sekce 16.4)
+LAST_MONTH <- "2025-10-01"    # listopad 2025 je v datech jen částečně
+TEST_YEAR  <- 2025
+RES_H3     <- 8
+CRS_M      <- 32633           # UTM 33N – metrické CRS pro vzdálenosti
+BUFFER_M   <- 500
+COORD_DIGITS <- 6             # zaokrouhlení souřadnic při párování činů s anonymizačními body
+
+UNIT_TAG <- if (UNIT == "h3") paste0("h3res", RES_H3) else "vor"
+
+# Výběr deliktů (kódy z ciselniky/types.json; seznam typů deliktu obsahuje i nadřazené kódy)
+CRIME_SETS <- list(
+  trestne_ciny = c(1, 18, 35, 54, 55, 63, 80, 84, 96),  # všechny kategorie trestné činnosti
+  ulicni       = c(1, 18, 35, 63, 80),                  # bez podvodů (54) a jiné majetkové (55), kde místo často není místem činu
+  nasilna      = 1,
+  kradeze      = 35,
+  vloupani     = 18
+)
+CRIME_SET        <- "trestne_ciny"   # hlavní závislá proměnná
+CODE_PRESTUPKY   <- 97               # přestupky se vylučují vždy
+RELEVANCE_KEEP   <- 4                # 4 = místo spáchání (2 = místo oznámení, často služebna)
+# Stav objasnění se nefiltruje: je to poslední známý stav a čerstvé případy nejsou dořešené.
+# Filtr na 3/4 ("skutek se nestal", "není TČ") by v roce 2025 odebral 3,3 %, v letech 2019–2024 ~6 %,
+# tj. uměle by zvyšoval poslední (testovací) rok. Pro citlivostní analýzu lze nastavit c(3, 4).
+STATE_DROP       <- integer(0)
+
+# Kategorie pro srovnání sezónních profilů
+SEASON_GROUPS <- c("nasilna", "kradeze", "vloupani")
+
+dir.create("cache", showWarnings = FALSE)
+
+# Spočítá objekt jen jednou a uloží ho do cache/<name>.rds
+cached <- function(name, expr) {
+  f <- file.path("cache", paste0(name, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  x <- expr
+  saveRDS(x, f)
+  x
+}
+```
+
+## 2. Crimes
+
+Z 2,6 GB GeoJSONu se načtou jen potřebné sloupce.
+
+```{r}
+crimes_all <- cached("crimes_prague_full", st_read(
+  CRIME_FILE,
+  query = "SELECT id, mp, date, state, relevance, types FROM crimes_prague",
+  quiet = TRUE
+))
+
+# klíč anonymizačního bodu = zaokrouhlené souřadnice
+coord_key <- function(x) {
+  xy <- st_coordinates(x)
+  paste(round(xy[, 1], COORD_DIGITS), round(xy[, 2], COORD_DIGITS))
+}
+
+# Anonymizační body ze všech záznamů (všechny roky, i přestupky): generátory Voroného polygonů
+generators_all <- {
+  xy <- round(st_coordinates(crimes_all), COORD_DIGITS)
+  distinct(tibble(key = paste(xy[, 1], xy[, 2]), x = xy[, 1], y = xy[, 2]))
+}
+
+crimes_all <- crimes_all |>
+  mutate(year = year(date), month = month(date)) |>
+  filter(year >= YEAR_MIN, floor_date(date, "month") <= as.Date(LAST_MONTH))
+
+crimes_all$types_list <- lapply(strsplit(crimes_all$types, ";"), as.integer)
+```
+
+### 2.1 Číselník typů a výběr trestných činů
+
+Každý delikt může mít více tříd a seznam obsahuje i nadřazené kódy (např. `35;37` = Krádeže → krádež auta). Pro výběr kategorie proto stačí testovat kód kořene. Přestupky (kód 97, z toho 57 % všech záznamů tvoří dopravní přestupky BESIP) měří spíš aktivitu policie než kriminalitu, proto se vylučují.
+
+```{r}
+types_cis <- fromJSON("ciselniky/types.json")$polozky
+types_cis <- tibble(
+  kod    = types_cis$kod,
+  nazev  = types_cis$nazev$cs,
+  popis  = types_cis$popis$cs,
+  parent = as.integer(sub(".*/", "", types_cis$iri_1))
+)
+
+has_code <- function(types_list, codes) {
+  vapply(types_list, function(t) any(t %in% codes), logical(1))
+}
+
+crimes_all <- crimes_all |>
+  mutate(
+    is_prestupek = has_code(types_list, CODE_PRESTUPKY),
+    base_keep    = !is_prestupek &
+                   relevance %in% RELEVANCE_KEEP &
+                   !(state %in% STATE_DROP)
+  )
+
+# Kolik záznamů připadá na jednotlivé kořenové kategorie (po základním filtru)
+types_cis |>
+  filter(is.na(parent)) |>
+  rowwise() |>
+  mutate(n = sum(crimes_all$base_keep & has_code(crimes_all$types_list, kod))) |>
+  ungroup() |>
+  arrange(desc(n))
+
+crimes <- crimes_all |>
+  filter(base_keep, has_code(types_list, CRIME_SETS[[CRIME_SET]]))
+
+# tag do názvů cache: jiný výběr deliktů = jiné modely
+CRIME_TAG <- paste0(CRIME_SET, "_", YEAR_MIN, "_", UNIT_TAG)
+
+c(all_records = nrow(crimes_all), kept = nrow(crimes))
+
+# Anonymizace: činy leží jen na omezeném počtu bodů
+nrow(distinct(as.data.frame(st_coordinates(crimes))))
+```
+
+## 3. Prague boundary and spatial units
+
+Policie publikuje místo každého činu jako **generátor Voroného polygonu**, do kterého čin skutečně spadá (polygony vznikly shlukováním K-Means nad daty za rok 2018 a jsou v čase pevné). Voroného rozdělení z unikátních publikovaných bodů oříznuté hranicí Prahy proto rekonstruuje policejní anonymizační oblasti. Pro tyto polygony jsou počty činů **přesné**. U H3 mřížky se naopak celý počet polygonu přiřadí buňce, ve které leží jeho bod, i když polygon zasahuje do sousedních buněk, a buňky bez bodu mají nulu z konstrukce dat.
+
+Předpoklad: body posunuté policií na hranici obce leží v Praze na hranici oříznutí, takže rekonstrukce u okraje nemusí být přesná.
+
+```{r}
+prague <- cached("prague_boundary", {
+  prague_poly <- getbb("Praha, Czech Republic", format_out = "polygon")
+  st_sfc(
+    lapply(prague_poly, function(feature) {
+      coords <- as.matrix(feature[[1]])
+      storage.mode(coords) <- "double"
+      st_polygon(list(coords))
+    }),
+    crs = 4326
+  ) |>
+    st_as_sf() |>
+    summarise() |>
+    st_make_valid()
+})
+
+prague_m <- st_transform(prague, CRS_M)
+
+if (UNIT == "h3") {
+  h3_ids <- unlist(polygon_to_cells(prague, res = RES_H3, simple = TRUE))
+  h3_ids <- h3_ids[!is.na(h3_ids)]
+
+  units <- cell_to_polygon(h3_ids, simple = FALSE) |>
+    rename(key = h3_address)
+} else {
+  gens_m <- st_as_sf(generators_all, coords = c("x", "y"), crs = 4326) |>
+    st_filter(prague) |>
+    st_transform(CRS_M)
+
+  vor <- st_voronoi(st_union(gens_m), envelope = st_geometry(prague_m)) |>
+    st_collection_extract("POLYGON") |>
+    st_intersection(st_geometry(prague_m))
+
+  # každý generátor leží právě v jednom svém polygonu
+  gen_in <- st_intersects(gens_m, vor)
+  stopifnot(all(lengths(gen_in) == 1))
+
+  units <- st_sf(key = gens_m$key, geometry = vor[unlist(gen_in)]) |>
+    st_transform(4326)
+}
+
+units <- units |>
+  arrange(key) |>
+  mutate(id = row_number())
+
+units_m <- st_transform(units, CRS_M)
+units$area_km2 <- as.numeric(st_area(units_m)) / 1e6
+
+c(n_units = nrow(units), quantile(units$area_km2, c(0, 0.1, 0.5, 0.9, 1)))
+```
+
+```{r}
+ggplot(units) +
+  geom_sf(fill = NA, colour = "steelblue", linewidth = 0.15) +
+  geom_sf(data = prague, fill = NA, colour = "black", linewidth = 0.5) +
+  theme_void() +
+  labs(title = paste("Spatial units:", UNIT, "(n =", nrow(units), ")"))
+```
+
+## 4. Crime counts per unit and month
+
+U Voroného polygonů se čin přiřadí podle shody souřadnic s generátorem, u H3 podle H3 indexu (`point_to_cell`).
+
+```{r}
+assign_unit <- function(x) {
+  if (UNIT == "h3") point_to_cell(x, res = RES_H3) else coord_key(x)
+}
+
+crimes$key <- assign_unit(crimes)
+
+c(assigned_share = mean(crimes$key %in% units$key))
+
+crime_counts_month <- crimes |>
+  st_drop_geometry() |>
+  filter(key %in% units$key) |>
+  count(key, year, month, name = "crime_count")
+
+time_index <- crimes_all |>
+  st_drop_geometry() |>
+  distinct(year, month) |>
+  arrange(year, month)
+
+time_index
+
+# Počty podle kategorií pro sezónní profily (sekce 16)
+crimes_all$key <- assign_unit(crimes_all)
+
+crime_counts_group <- bind_rows(lapply(SEASON_GROUPS, function(g) {
+  crimes_all |>
+    st_drop_geometry() |>
+    filter(base_keep, key %in% units$key, has_code(types_list, CRIME_SETS[[g]])) |>
+    count(key, year, month, name = "crime_count") |>
+    mutate(group = g)
+}))
+
+count(crime_counts_group, group, wt = crime_count)
+```
+
+## 5. Static regressors (one row per cell)
+
+### 5.1 GHSL and WorldPop
+
+```{r}
+r <- rast(GHSL_FILE)
+names(r) <- "ghsl"
+# exact = TRUE: pixel se vezme s vahou podle podílu, kterým leží v jednotce
+# (malé polygony v centru pokrývají jen pár pixelů WorldPop 100 m)
+ghsl_vals <- terra::extract(r, vect(st_transform(units, crs(r))), fun = mean, na.rm = TRUE, exact = TRUE)
+
+pop_r <- rast(POP_FILE)
+names(pop_r) <- "population"
+pop_vals <- terra::extract(pop_r, vect(st_transform(units, crs(pop_r))), fun = sum, na.rm = TRUE, exact = TRUE)
+
+static_raster <- tibble(
+  id         = units$id,
+  ghsl_mean  = ghsl_vals$ghsl,
+  population = replace_na(pop_vals$population, 0)
+)
+```
+
+### 5.2 OSM: streets, pubs, metro
+
+```{r}
+bb <- st_bbox(prague)
+
+# OSM dotaz s cache a opakováním (Overpass občas vrací 429 Too Many Requests)
+osm_cached <- function(name, key, value, tries = 5) {
+  f <- file.path("cache", paste0("osm_", name, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  for (i in seq_len(tries)) {
+    res <- tryCatch(
+      opq(bbox = bb, timeout = 300) |>
+        add_osm_feature(key = key, value = value) |>
+        osmdata_sf(),
+      error = function(e) {
+        message("Overpass failed (", i, "): ", conditionMessage(e))
+        NULL
+      }
+    )
+    if (!is.null(res)) {
+      saveRDS(res, f)
+      return(res)
+    }
+    Sys.sleep(60 * i)
+  }
+  stop("Overpass query failed: ", name)
+}
+
+# Řidší síť: jen hlavní silnice (bez "residential")
+car_highways <- c(
+  "motorway", "trunk", "primary", "secondary", "tertiary",
+  "motorway_link", "trunk_link", "primary_link",
+  "secondary_link", "tertiary_link"
+)
+
+osm_streets <- osm_cached("streets", "highway", car_highways)
+osm_pubs    <- osm_cached("pubs", "amenity", c("pub", "bar", "restaurant", "cafe"))
+osm_metro   <- osm_cached("metro", "railway", c("station", "halt", "subway_entrance"))
+```
+
+### 5.3 Street network and centralities
+
+`as_sfnetwork()` vytváří uzly jen na koncích OSM cest. Dvě ulice, které se kříží uprostřed cesty, proto nejsou propojené a síť se rozpadne na tisíce komponent. `to_spatial_subdivision` doplní uzly do sdílených vrcholů a `to_spatial_smooth` odstraní pseudo-uzly se stupněm 2 (jinak by stahovaly `deg_mean` k hodnotě 2). Nakonec se ponechá největší souvislá komponenta.
+
+Síť obsahuje jen hlavní silnice (bez `residential`), takže je řidší a centrality lze počítat globálně. Closeness a betweenness jsou vážené délkou hran v metrech. U husté sítě (s `residential`) by bylo potřeba počítat lokálně, např. `cutoff = 2000`.
+
+```{r}
+nodes_sf <- cached("nodes_centrality", {
+  streets <- osm_streets$osm_lines |>
+    dplyr::select(osm_id, highway) |>
+    st_cast("LINESTRING") |>
+    st_transform(CRS_M)
+
+  net <- as_sfnetwork(streets, directed = FALSE) |>
+    convert(to_spatial_subdivision) |>
+    convert(to_spatial_smooth) |>
+    activate(nodes) |>
+    filter(group_components() == 1)
+
+  edge_len <- as.numeric(st_length(st_as_sf(net, "edges")))
+
+  net <- net |>
+    activate(edges) |>
+    mutate(length = edge_len) |>
+    activate(nodes) |>
+    mutate(
+      deg  = centrality_degree(),
+      clos = centrality_closeness(weights = length),
+      betw = centrality_betweenness(weights = length),
+      eig  = centrality_eigen()
+    )
+
+  st_as_sf(net, "nodes")
+})
+```
+
+V řidší síti hlavních silnic mnoho buněk nemá žádný uzel. Průměr přes uzly uvnitř buňky by jim dal 0 a proměnná by pak jen říkala, zda buňkou vede hlavní silnice. Proto se centralita jednotky počítá jako průměr **K nejbližších uzlů** k jejímu středu. `n_nodes` (počet uzlů uvnitř jednotky) zůstává jako doplňková informace.
+
+```{r}
+K_NODES <- 5
+
+unit_centroids <- st_point_on_surface(st_geometry(units_m))
+node_xy <- st_coordinates(nodes_sf)
+cent_xy <- st_coordinates(unit_centroids)
+
+# K nejbližších uzlů pro každý střed jednotky (~3 800 uzlů × ~2 000 jednotek -> stačí plná matice vzdáleností)
+d2 <- outer(cent_xy[, 1], node_xy[, 1], "-")^2 + outer(cent_xy[, 2], node_xy[, 2], "-")^2
+knn <- t(apply(d2, 1, function(d) order(d)[seq_len(K_NODES)]))
+
+knn_mean <- function(v) rowMeans(matrix(v[knn], nrow = nrow(knn)))
+
+static_network <- tibble(
+  key       = units_m$key,
+  deg_mean  = knn_mean(nodes_sf$deg),
+  clos_mean = knn_mean(nodes_sf$clos),
+  betw_mean = knn_mean(nodes_sf$betw),
+  eig_mean  = knn_mean(nodes_sf$eig),
+  dist_node = sqrt(d2[cbind(seq_len(nrow(knn)), knn[, 1])]),
+  n_nodes   = lengths(st_intersects(units_m, nodes_sf))
+)
+
+nrow(nodes_sf)
+```
+
+### 5.4 Pubs and metro within 500 m
+
+Restaurace jsou v OSM často zakreslené jako polygon (budova), ne jako bod. Proto se berou body i centroidy polygonů. Pro body, které tvoří vrcholy polygonů, je potřeba vzít jen ty s vyplněným `amenity`.
+
+```{r}
+osm_to_points <- function(osm, key) {
+  pts <- osm$osm_points |>
+    filter(!is.na(.data[[key]])) |>
+    dplyr::select(osm_id)
+  polys <- osm$osm_polygons
+  if (!is.null(polys) && nrow(polys) > 0) {
+    polys <- polys |>
+      filter(!is.na(.data[[key]])) |>
+      dplyr::select(osm_id) |>
+      st_make_valid() |>
+      st_centroid()
+    pts <- bind_rows(pts, polys)
+  }
+  st_transform(pts, CRS_M)
+}
+
+pubs_m  <- osm_to_points(osm_pubs,  "amenity")
+metro_m <- osm_to_points(osm_metro, "railway")
+
+static_osm <- tibble(
+  id            = units_m$id,
+  n_pubs_500    = lengths(st_is_within_distance(units_m, pubs_m,  dist = BUFFER_M)),
+  has_metro_500 = as.integer(lengths(st_is_within_distance(units_m, metro_m, dist = BUFFER_M)) > 0)
+)
+```
+
+### 5.5 Merge static regressors
+
+```{r}
+static_vars <- units |>
+  st_drop_geometry() |>
+  dplyr::select(id, key, area_km2) |>
+  left_join(static_raster,  by = "id") |>
+  left_join(static_osm,     by = "id") |>
+  left_join(static_network, by = "key") |>
+  mutate(
+    pop_offset = log(population + 1),
+    log_pop    = log(population + 1),
+    log_area   = log(area_km2)
+  )
+
+stopifnot(nrow(static_vars) == nrow(units), !anyDuplicated(static_vars$id))
+summary(static_vars)
+```
+
+Voroného polygony mají velmi různou plochu (v centru desítky arů, na okraji přes 1 km²). Větší polygon má za jinak stejných podmínek víc činů, proto se u nich přidává `log_area` jako regresor. U H3 je plocha konstantní a regresor by nešel odhadnout.
+
+Regresory se standardizují (z-skóre přes jednotky). Koeficient pak znamená změnu log(μ) při zvýšení proměnné o 1 směrodatnou odchylku a `exp(beta)` je incidence rate ratio (IRR) na 1 SD. Díky tomu jsou koeficienty srovnatelné a `glmmTMB` lépe konverguje. `has_metro_500` zůstává 0/1.
+
+```{r}
+x_vars <- c("ghsl_mean", "clos_mean", "eig_mean", "deg_mean", "n_pubs_500")
+if (UNIT == "voronoi") x_vars <- c(x_vars, "log_area")
+
+static_vars <- static_vars |>
+  mutate(across(all_of(x_vars), ~ as.numeric(scale(.x)), .names = "{.col}_z"))
+
+x_z <- c(paste0(x_vars, "_z"), "has_metro_500")
+
+round(cor(static_vars[, x_z]), 2)
+```
+
+## 6. Panel data
+
+```{r}
+panel_df <- expand_grid(id = static_vars$id, time_index) |>
+  left_join(static_vars, by = "id") |>
+  left_join(crime_counts_month, by = c("key", "year", "month")) |>
+  mutate(
+    crime_count = replace_na(crime_count, 0L),
+    trend       = (year - YEAR_MIN) + (month - 1) / 12,
+    month_num   = month,
+    year_f      = factor(year),
+    log_days    = log(days_in_month(make_date(year, month, 1))),
+    s1          = sin(2 * pi * month / 12),
+    c1          = cos(2 * pi * month / 12),
+    month       = factor(month),
+    id_f        = factor(id)
+  )
+
+stopifnot(nrow(panel_df) == nrow(static_vars) * nrow(time_index))
+
+c(
+  n_units  = n_distinct(panel_df$id),
+  n_months = nrow(time_index),
+  mean     = mean(panel_df$crime_count),
+  var      = var(panel_df$crime_count),
+  zeros    = mean(panel_df$crime_count == 0),
+  all_zero_cells = sum(tapply(panel_df$crime_count, panel_df$id, sum) == 0)
+)
+```
+
+## 7. Spatial weights
+
+U H3 se sousedé berou přímo z H3 (`get_ring`, 6 sousedů). U Voroného polygonů jsou sousedé polygony se společnou hranou nebo vrcholem (`poly2nb`, queen). Voroného polygony sdílejí hrany přesně, takže nehrozí chybějící vazby kvůli zaokrouhlení.
+
+```{r}
+if (UNIT == "h3") {
+  ring <- get_ring(static_vars$key, ring_size = 1)
+  nb <- lapply(ring, function(nbrs) {
+    idx <- sort(match(nbrs, static_vars$key))
+    idx <- idx[!is.na(idx)]
+    if (length(idx) == 0) 0L else as.integer(idx)
+  })
+  class(nb) <- "nb"
+  attr(nb, "region.id") <- as.character(static_vars$id)
+  attr(nb, "sym") <- TRUE
+} else {
+  stopifnot(all(units_m$id == static_vars$id))
+  nb <- poly2nb(units_m, queen = TRUE, row.names = as.character(static_vars$id))
+}
+
+table(card(nb))
+
+keep_nb <- card(nb) > 0
+nb_sub  <- subset(nb, subset = keep_nb)
+lw_sub  <- nb2listw(nb_sub, style = "W")
+```
+
+## 8. Train / test split
+
+```{r}
+train_df <- panel_df |> filter(year <  TEST_YEAR)
+test_df  <- panel_df |> filter(year == TEST_YEAR)
+
+# Efekt roku 2025 z trénovacích dat neznáme -> pro predikci se použije efekt posledního roku (2024)
+train_df$year_f <- droplevels(train_df$year_f)
+test_df$year_f  <- factor(TEST_YEAR - 1, levels = levels(train_df$year_f))
+```
+
+## 9. MEM basis
+
+Moran Eigenvector Maps jsou vlastní vektory dvojitě centrované matice sousednosti $\Omega = (I - \mathbf{1}\mathbf{1}^\top/n)\,W\,(I - \mathbf{1}\mathbf{1}^\top/n)$ s binární symetrickou $W$. Vlastní vektory jsou ortonormální a nekorelované s konstantou. Moranovo I vlastního vektoru $k$ je $I_k = \frac{n}{\mathbf{1}^\top W \mathbf{1}}\lambda_k$, takže vektory s velkým kladným $\lambda_k$ popisují hladké prostorové vzory velkého měřítka a s malým kladným $\lambda_k$ lokální vzory. Kandidáty jsou jen vektory s kladnou autokorelací (kriminalita je shluknutá, ne šachovnicová).
+
+Oproti `spatialreg::ME()` se báze počítá jednou a výběr (sekce 10.3) cílí přímo na to, co má MEM vysvětlit: prostorový vzor v náhodných efektech buněk.
+
+```{r}
+stopifnot(all(keep_nb))   # MEM báze níže předpokládá, že každá buňka má souseda
+
+mem_basis <- cached(paste0("mem_basis_", UNIT_TAG), {
+  B  <- listw2mat(nb2listw(nb, style = "B"))
+  n  <- nrow(B)
+  Cn <- diag(n) - matrix(1 / n, n, n)
+  eg <- eigen(Cn %*% B %*% Cn, symmetric = TRUE)
+  pos <- which(eg$values > 1e-8)
+  list(
+    vectors = eg$vectors[, pos],
+    moran_I = n / sum(B) * eg$values[pos]
+  )
+})
+
+MEM <- mem_basis$vectors
+colnames(MEM) <- paste0("ev_", seq_len(ncol(MEM)))
+mem_I <- mem_basis$moran_I
+
+c(n_positive = ncol(MEM), n_I_over_025 = sum(mem_I / max(mem_I) > 0.25))
+
+# připojí vybrané sloupce MEM k panelovým datům
+add_mem_cols <- function(df, cols, names_out = colnames(MEM)[cols]) {
+  m <- as.data.frame(MEM[, cols, drop = FALSE])
+  names(m) <- names_out
+  m$id <- static_vars$id
+  left_join(df, m, by = "id")
+}
+```
+
+## 10. Models
+
+Všechny modely mají stejný časový základ: fixní efekty měsíce (sezónnost) a fixní efekty roku. Lineární trend by přes období 2016–2025 nestačil kvůli propadu během COVID (2020–2021). Úroveň roku 2025 v trénovacích datech neexistuje, proto se pro predikci testovacího roku použije efekt roku 2024 (předpoklad, že úroveň kriminality zůstane jako v posledním známém roce).
+
+Obecně:
+
+$$
+\log \mu_{it} = \log(\text{pop}_i + 1) + x_i^\top\beta + \gamma_{m(t)} + \delta_{y(t)} + c_i ,
+\qquad y_{it}\mid c_i \sim NB(\mu_{it}, \alpha)
+$$
+
+Modely se liší tím, jak zacházejí s nepozorovanou heterogenitou buňky $c_i$:
+
+| model | $c_i$ | lze odhadnout statické $x_i$? |
+|---|---|---|
+| pooled NB | ignorováno (část rozptylu NB) | ano, ale SE musí být clusterované podle buňky |
+| NB + MEM | $c_i = \sum_k \theta_k \text{MEM}_{ik}$ (prostorová část) | ano |
+| RE NB | $c_i \sim N(0,\sigma_u^2)$, nezávislé na $x_i$ | ano |
+| RE NB + MEM | $\sum_k \theta_k \text{MEM}_{ik} + u_i$, vybrané MEM jako fixní efekty | ano |
+| RE-ESF NB | $\sum_k \theta_k \text{MEM}_{ik} + u_i$, $\theta_k \sim N(0, \sigma_\theta^2)$ | ano |
+| FE NB | libovolný parametr pro každou buňku | **ne**, všechny $x_i$ jsou konstantní v čase a pohltí je $c_i$ |
+
+```{r}
+rhs_x <- paste(c(x_z), collapse = " + ")
+```
+
+### 10.1 Pooled NB (baseline)
+
+```{r}
+m_nb_base <- fenegbin(
+  as.formula(paste("crime_count ~", rhs_x, "+ offset(pop_offset) | month + year_f")),
+  data    = train_df,
+  cluster = ~id
+)
+```
+
+### 10.2 Random effects NB
+
+Náhodný intercept buňky $u_i \sim N(0, \sigma_u^2)$. Zachycuje trvalé rozdíly mezi buňkami, které regresory nevysvětlí. Díky tomu nejsou pozorování jedné buňky v čase považována za nezávislá. Klíčový předpoklad je $E(u_i \mid x_i) = 0$.
+
+```{r}
+m_nb_re <- cached(paste0("m_nb_re_", CRIME_TAG), glmmTMB(
+  as.formula(paste("crime_count ~", rhs_x, "+ month + year_f + offset(pop_offset) + (1 | id_f)")),
+  data   = train_df,
+  family = nbinom2
+))
+
+re_blup <- function(m) {
+  u <- ranef(m)$cond$id_f
+  u[as.character(static_vars$id), "(Intercept)"]
+}
+```
+
+### 10.3 MEM selection targeted at the random effects
+
+Proč původní `ME()` nefungoval:
+
+1. vybíral podle Moranova I **surových** reziduí $y - \hat\mu$ Poissonova průřezového modelu, kterým dominuje pár buněk v centru s tisíci činy,
+2. hledal vzor v celkových počtech, ale v RE modelu MEM soutěží s $u_i$, který pohltí vše, co je v buňce konstantní. Užitečný je jen ten vzor, který zůstane v $\hat u_i$,
+3. zastavil se po prvním kroku, protože výchozí p-hodnota byla jen 0,03 a jediný přidaný vektor stačil.
+
+Nový postup: cílem je $\hat u_i$ z RE modelu (prostorově autokorelovaná nevysvětlená úroveň buňky). Protože jsou MEM ortonormální a centrované, přínos vektoru $k$ k $R^2$ je $(\text{MEM}_k^\top \hat u)^2$ a nezávisí na ostatních, takže dopředný výběr = seřazení podle tohoto skóre. Vektory se přidávají, dokud je Moranovo I zbytku $\hat u$ významné (stop kritérium podle Blanchet et al. 2008).
+
+Pozor: výběr i následný odhad používají stejná trénovací data, takže AIC modelu s vybranými MEM je mírně optimistické (post-selection). Poctivé srovnání je predikce na roce 2025 (sekce 13).
+
+```{r}
+u_hat <- re_blup(m_nb_re)
+u_c   <- u_hat - mean(u_hat)
+
+mem_score <- as.numeric(crossprod(MEM, u_c))^2
+mem_order <- order(mem_score, decreasing = TRUE)
+
+mem_sel <- integer(0)
+r <- u_c
+for (k in mem_order) {
+  if (moran.test(r, lw_sub, alternative = "greater")$p.value > 0.05) break
+  mem_sel <- c(mem_sel, k)
+  r <- residuals(lm(u_c ~ MEM[, mem_sel]))
+}
+
+mem_names <- paste0("mem_", seq_along(mem_sel))
+rhs_mem   <- paste(mem_names, collapse = " + ")
+
+tibble(mem = mem_names, eigenvector = mem_sel, moran_I = mem_I[mem_sel], score = mem_score[mem_sel])
+
+train_df <- add_mem_cols(train_df, mem_sel, mem_names)
+test_df  <- add_mem_cols(test_df,  mem_sel, mem_names)
+```
+
+```{r}
+m_nb_mem <- fenegbin(
+  as.formula(paste("crime_count ~", rhs_x, "+", rhs_mem, "+ offset(pop_offset) | month + year_f")),
+  data    = train_df,
+  cluster = ~id
+)
+
+m_nb_re_mem <- cached(paste0("m_nb_re_mem_", CRIME_TAG), glmmTMB(
+  as.formula(paste("crime_count ~", rhs_x, "+", rhs_mem, "+ month + year_f + offset(pop_offset) + (1 | id_f)")),
+  data   = train_df,
+  family = nbinom2
+))
+```
+
+### 10.4 RE-ESF: MEM as random effects (no selection)
+
+Jen pokud `RUN_ESF = TRUE` (v rychlém režimu se přeskakuje). Alternativa bez postupného výběru (Murakami & Griffith 2015): vezmou se všechny MEM s $I_k / I_{max} > 0.25$ (Griffithova hranice) a jejich koeficienty jsou náhodné se společným rozptylem, $\theta_k \sim N(0, \sigma_\theta^2)$. Je to hřebenová (ridge) penalizace: data sama určí, kolik prostorového vzoru model připustí. Náhodný efekt buňky se tím rozkládá na **prostorovou** část $\sum_k \theta_k \text{MEM}_{ik}$ a **neprostorovou** část $u_i$, podobně jako u modelu BYM.
+
+V `glmmTMB` se to zapíše jako `homdiag(0 + ev_1 + ... | one)`, kde `one` je jedna skupina. Odhad trvá ~15 minut, proto je výsledek v cache.
+
+```{r eval=RUN_ESF}
+esf_cols  <- which(mem_I / max(mem_I) > 0.25)
+esf_names <- colnames(MEM)[esf_cols]
+
+train_df <- add_mem_cols(train_df, esf_cols) |> mutate(one = factor(1))
+test_df  <- add_mem_cols(test_df,  esf_cols) |> mutate(one = factor(1))
+
+m_nb_esf <- cached(paste0("m_nb_esf_", CRIME_TAG), glmmTMB(
+  as.formula(paste(
+    "crime_count ~", rhs_x, "+ month + year_f + offset(pop_offset) + (1 | id_f) +",
+    "homdiag(0 +", paste(esf_names, collapse = " + "), "| one)"
+  )),
+  data   = train_df,
+  family = nbinom2
+))
+
+esf_theta   <- unlist(ranef(m_nb_esf)$cond$one[1, esf_names])
+esf_spatial <- as.numeric(MEM[, esf_cols] %*% esf_theta)
+esf_u       <- re_blup(m_nb_esf)
+
+VarCorr(m_nb_esf)
+
+c(
+  var_spatial   = var(esf_spatial),
+  var_u         = var(esf_u),
+  spatial_share = var(esf_spatial) / (var(esf_spatial) + var(esf_u))
+)
+```
+
+### 10.5 Exposure: offset vs. log population as a regressor
+
+Offset `log(pop + 1)` vynucuje elasticitu kriminality vůči počtu rezidentů rovnou 1 (dvojnásobek obyvatel = dvojnásobek činů). V centru ale páchají a zažívají kriminalitu hlavně nerezidenti (dojíždějící, turisté). Pokud je odhadnutá elasticita výrazně pod 1, je offset chybná restrikce a zkresluje koeficienty proměnných korelovaných s populací (hlavně GHSL).
+
+```{r}
+m_nb_re_mem_pop <- cached(paste0("m_nb_re_mem_pop_", CRIME_TAG), glmmTMB(
+  as.formula(paste("crime_count ~", rhs_x, "+ log_pop +", rhs_mem, "+ month + year_f + (1 | id_f)")),
+  data   = train_df,
+  family = nbinom2
+))
+
+# H0: elasticita = 1 (tj. offset je správný)
+b_pop  <- fixef(m_nb_re_mem_pop)$cond["log_pop"]
+se_pop <- sqrt(vcov(m_nb_re_mem_pop)$cond["log_pop", "log_pop"])
+c(elasticity = unname(b_pop), se = se_pop, z_vs_1 = unname((b_pop - 1) / se_pop))
+```
+
+Kontrola rozdělení (simulovaná rezidua, DHARMa): nadměrný rozptyl a nadbytek nul.
+
+```{r}
+set.seed(1)
+dharma_re <- DHARMa::simulateResiduals(m_nb_re_mem_pop, n = 250)
+DHARMa::testDispersion(dharma_re, plot = FALSE)
+DHARMa::testZeroInflation(dharma_re, plot = FALSE)
+```
+
+### 10.6 Fixed effects NB
+
+S fixním efektem buňky se všechny statické regresory vypustí (jsou kolineární s FE). `fixest` je odstraní a vypíše, že jsou kolineární. Buňky, které mají ve všech měsících nulu, se také vyřadí, protože jejich FE by šel do $-\infty$.
+
+FE model tedy nemůže odpovědět na otázku *„mají buňky s více hospodami víc kriminality?"*. Může ale identifikovat **časově proměnné** efekty, například jestli se sezónní profil liší podle množství hospod (sekce 16). To je čistě *within-cell* srovnání, které nezávisí na předpokladu RE.
+
+```{r}
+# ukázka: statické proměnné se vypustí
+m_nb_fe_try <- fenegbin(
+  as.formula(paste("crime_count ~", rhs_x, "| id + month + year_f")),
+  data = train_df
+)
+
+m_nb_fe <- fenegbin(
+  # fenegbin neumí model jen s FE, proto roky jako regresor i(year_f)
+  crime_count ~ i(year_f, ref = as.character(YEAR_MIN)) | id + month,
+  data    = train_df,
+  cluster = ~id
+)
+```
+
+### 10.7 FE vs RE: co vysvětlí statické regresory?
+
+Hausmanův test se tu použít nedá, protože FE model nemá s RE žádný společný koeficient (všechny $x_i$ jsou statické). Ze stejného důvodu nepomůže ani Mundlakův přístup: průměr statické proměnné za buňku je proměnná sama.
+
+Místo toho se dá ukázat, jakou část odhadnutých fixních efektů buněk $\hat c_i$ vysvětlí regresory (tzv. two-step / FE decomposition):
+
+```{r}
+fe_cells <- tibble(
+  id   = as.integer(names(fixef(m_nb_fe)$id)),
+  c_hat = as.numeric(fixef(m_nb_fe)$id)
+) |>
+  left_join(static_vars, by = "id")
+
+m_fe_decomp <- feols(
+  as.formula(paste("c_hat ~", rhs_x, "+ pop_offset")),
+  data = fe_cells,
+  vcov = "hetero"
+)
+```
+
+## 11. Results
+
+```{r}
+etable(m_nb_base, m_nb_mem, m_nb_fe_try, m_nb_fe,
+       keep = c("%^ghsl", "%^clos", "%^eig", "%^deg", "%^n_pubs", "%^has_metro",
+                "year_f"),
+       fitstat = ~ n + ll + aic + bic + theta)
+```
+
+```{r}
+summary(m_nb_re)
+summary(m_nb_re_mem)
+summary(m_nb_re_mem_pop)
+```
+
+Srovnávací tabulka koeficientů (IRR = exp(β) na 1 SD):
+
+```{r}
+models_main <- list(
+  "Pooled NB"   = m_nb_base,
+  "NB + MEM"    = m_nb_mem,
+  "RE NB"       = m_nb_re,
+  "RE NB + MEM" = m_nb_re_mem,
+  "RE NB + MEM, log pop" = m_nb_re_mem_pop
+)
+if (RUN_ESF) models_main <- append(models_main, list("RE-ESF NB" = m_nb_esf), after = 4)
+
+coef_map <- c(
+  ghsl_mean_z   = "GHSL built-up (SD)",
+  clos_mean_z   = "Closeness (SD)",
+  eig_mean_z    = "Eigenvector (SD)",
+  deg_mean_z    = "Degree (SD)",
+  n_pubs_500_z  = "Pubs within 500 m (SD)",
+  has_metro_500 = "Metro/rail within 500 m",
+  log_area_z    = "log(area) (SD)",
+  log_pop       = "log(population + 1)"
+)
+
+# GOF řádky ručně: modelsummary u glmmTMB s metrics = "none" AIC nevypíše
+gof_rows <- bind_rows(
+  c(term = "Num.Obs.", sapply(models_main, function(m) format(nobs(m), big.mark = " "))),
+  c(term = "AIC",      sapply(models_main, function(m) format(round(AIC(m)), big.mark = " "))),
+  c(term = "BIC",      sapply(models_main, function(m) format(round(BIC(m)), big.mark = " ")))
+)
+
+modelsummary(
+  models_main,
+  exponentiate = TRUE,
+  coef_map     = coef_map,
+  statistic    = "({std.error})",
+  stars        = TRUE,
+  gof_map      = NA,
+  add_rows     = gof_rows,
+  metrics      = "none"   # bez R2/ICC z performance: u RE-ESF modelu trvají hodiny
+)
+
+modelsummary(
+  models_main,
+  exponentiate = TRUE,
+  coef_map     = coef_map,
+  statistic    = "({std.error})",
+  stars        = TRUE,
+  gof_map      = NA,
+  add_rows     = gof_rows,
+  metrics      = "none",
+  output       = paste0("img/models_re_fe_", CRIME_SET, ".tex")
+)
+```
+
+Pozor: SE v `modelsummary` u `fenegbin` modelů odpovídají `cluster = ~id` nastavenému při odhadu.
+
+Rozptyl náhodného efektu a intraclass podíl heterogenity:
+
+```{r}
+re_sd <- function(m) attr(VarCorr(m)$cond$id_f, "stddev")
+
+re_models <- models_main[grepl("^RE", names(models_main))]
+tibble(
+  model   = names(re_models),
+  sigma_u = sapply(re_models, re_sd),
+  theta   = sapply(re_models, sigma)
+)
+```
+
+$\sigma_u$ je směrodatná odchylka náhodného efektu na log škále. Buňka o 1 $\sigma_u$ nad průměrem má za jinak stejných podmínek $e^{\sigma_u}$-krát vyšší očekávaný počet. Pokles $\sigma_u$ po přidání MEM ukazuje, kolik z heterogenity buněk je prostorově strukturované.
+
+FE decomposition:
+
+```{r}
+summary(m_fe_decomp)
+```
+
+## 12. Likelihood comparison (train)
+
+Všechny modely v tabulce jsou odhadnuté na stejném vzorku, takže AIC/BIC jsou srovnatelné. FE model má jiný vzorek (vypadnou buňky se samými nulami), a proto se s ostatními přes AIC nesrovnává.
+
+```{r}
+tibble(
+  model = names(models_main),
+  nobs  = sapply(models_main, nobs),
+  logLik = sapply(models_main, function(m) as.numeric(logLik(m))),
+  AIC   = sapply(models_main, AIC),
+  BIC   = sapply(models_main, BIC)
+)
+```
+
+## 13. Out-of-sample prediction (2025)
+
+RE model umí predikovat dvěma způsoby:
+
+* **conditional** (`re.form = NULL`): použije odhadnutý $\hat u_i$ buňky. Odpovídá otázce „jak bude vypadat příští rok v *známých* buňkách".
+* **marginal** (`re.form = NA`): $u_i = 0$, predikce jen z regresorů. Odpovídá otázce „co předpovídají charakteristiky prostředí" a je férově srovnatelná s pooled modelem.
+
+FE model predikuje jen conditional a jen pro buňky, které měl v trénovacích datech. Buňky se samými nulami dostanou `NA`, proto se u nich doplní predikce 0.
+
+```{r}
+test_df <- test_df |>
+  mutate(
+    pred_base     = predict(m_nb_base, newdata = test_df),
+    pred_mem      = predict(m_nb_mem,  newdata = test_df),
+    pred_re_cond  = predict(m_nb_re,     newdata = test_df, type = "response", allow.new.levels = TRUE),
+    pred_re_marg  = predict(m_nb_re,     newdata = test_df, type = "response", re.form = NA),
+    pred_rem_cond = predict(m_nb_re_mem, newdata = test_df, type = "response", allow.new.levels = TRUE),
+    pred_rem_marg = predict(m_nb_re_mem, newdata = test_df, type = "response", re.form = NA),
+    pred_pop_cond = predict(m_nb_re_mem_pop, newdata = test_df, type = "response", allow.new.levels = TRUE),
+    pred_pop_marg = predict(m_nb_re_mem_pop, newdata = test_df, type = "response", re.form = NA),
+    pred_fe       = replace_na(predict(m_nb_fe, newdata = test_df), 0)
+  )
+
+if (RUN_ESF) {
+  test_df <- test_df |>
+    mutate(
+      pred_esf_cond = predict(m_nb_esf, newdata = test_df, type = "response", allow.new.levels = TRUE),
+      # X beta + prostorový filtr (bez neprostorového u_i); predict(re.form = NA) by vynechal i MEM
+      pred_esf_marg = exp(
+        predict(m_nb_esf, newdata = test_df, type = "link", re.form = NA) +
+        esf_spatial[match(test_df$id, static_vars$id)]
+      )
+    )
+}
+
+pred_cols <- c(
+  "Pooled NB"                  = "pred_base",
+  "NB + MEM"                   = "pred_mem",
+  "RE NB (marginal)"           = "pred_re_marg",
+  "RE NB + MEM (marginal)"     = "pred_rem_marg",
+  "RE NB + MEM, log pop (marginal)" = "pred_pop_marg",
+  "RE NB (conditional)"        = "pred_re_cond",
+  "RE NB + MEM (conditional)"  = "pred_rem_cond",
+  "RE NB + MEM, log pop (conditional)" = "pred_pop_cond",
+  "FE NB (conditional)"        = "pred_fe"
+)
+
+if (RUN_ESF) {
+  pred_cols <- c(pred_cols,
+    "RE-ESF NB (X + spatial)" = "pred_esf_marg",
+    "RE-ESF NB (conditional)" = "pred_esf_cond"
+  )
+}
+
+oos_metrics <- function(y, mu) {
+  c(
+    RMSE       = sqrt(mean((y - mu)^2)),
+    MAE        = mean(abs(y - mu)),
+    cor_log    = cor(log1p(y), log1p(mu)),
+    spearman   = cor(y, mu, method = "spearman"),
+    total_bias = sum(mu) / sum(y) - 1
+  )
+}
+
+stopifnot(!anyNA(test_df[, pred_cols]))
+
+oos <- t(sapply(pred_cols, function(col) oos_metrics(test_df$crime_count, test_df[[col]])))
+round(oos, 3)
+```
+
+Stejné metriky na úrovni buňky (součet za testovací období), tj. jak dobře model rozlišuje rizikové a bezpečné oblasti:
+
+```{r}
+test_cell <- test_df |>
+  group_by(id) |>
+  summarise(across(c(crime_count, all_of(unname(pred_cols))), sum), .groups = "drop")
+
+oos_cell <- t(sapply(pred_cols, function(col) oos_metrics(test_cell$crime_count, test_cell[[col]])))
+round(oos_cell, 3)
+```
+
+## 14. Residual spatial autocorrelation
+
+U pooled modelů se testuje Moranovo I průměrného Pearsonova rezidua buňky. U RE modelů by bylo zavádějící testovat podmíněná rezidua, protože trvalou odchylku buňky pohltí $\hat u_i$. Testuje se proto Moranovo I samotných **odhadů náhodných efektů** $\hat u_i$. Pokud jsou prostorově autokorelované, sousední buňky mají podobnou nevysvětlenou úroveň kriminality a RE předpoklad nezávislých $u_i$ je porušen. To motivuje prostorový náhodný efekt (BYM2/ICAR, např. v INLA) nebo MEM.
+
+```{r}
+moran_cells <- function(values) {
+  v <- values[keep_nb]
+  moran.mc(v, listw = lw_sub, nsim = 999)
+}
+
+cell_resid <- function(m, df) {
+  df |>
+    mutate(r = residuals(m, type = "pearson")) |>
+    group_by(id) |>
+    summarise(r = mean(r), .groups = "drop") |>
+    arrange(id) |>
+    pull(r)
+}
+
+moran_tab <- list(
+  "Pooled NB: resid"       = moran_cells(cell_resid(m_nb_base, train_df)),
+  "NB + MEM: resid"        = moran_cells(cell_resid(m_nb_mem,  train_df)),
+  "RE NB: u_i"             = moran_cells(re_blup(m_nb_re)),
+  "RE NB + MEM: u_i"       = moran_cells(re_blup(m_nb_re_mem)),
+  "RE NB + MEM, log pop: u_i"    = moran_cells(re_blup(m_nb_re_mem_pop))
+)
+if (RUN_ESF) moran_tab[["RE-ESF NB: u_i (non-spatial)"]] <- moran_cells(esf_u)
+
+tibble(
+  what    = names(moran_tab),
+  moran_I = sapply(moran_tab, function(x) unname(x$statistic)),
+  p_value = sapply(moran_tab, function(x) x$p.value)
+)
+```
+
+## 15. Maps
+
+```{r}
+hex_plot <- units |>
+  left_join(static_vars |> dplyr::select(id), by = "id") |>
+  mutate(
+    u_re     = re_blup(m_nb_re),
+    u_re_mem = re_blup(m_nb_re_mem)
+  )
+
+u_lim <- max(abs(c(hex_plot$u_re, hex_plot$u_re_mem)))
+
+plot_u <- function(col, title) {
+  ggplot(hex_plot) +
+    geom_sf(aes(fill = .data[[col]]), color = NA) +
+    geom_sf(data = prague, fill = NA, color = "black", linewidth = 0.3) +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red", midpoint = 0,
+      limits = c(-u_lim, u_lim), name = expression(hat(u)[i])
+    ) +
+    theme_void() +
+    labs(title = title)
+}
+
+p_u_re     <- plot_u("u_re",     "Random effects of spatial units: RE NB")
+p_u_re_mem <- plot_u("u_re_mem", "Random effects of spatial units: RE NB + MEM")
+p_u_re
+p_u_re_mem
+
+ggsave(paste0("vysledky/re_u_map_", CRIME_SET, ".png"),     p_u_re,     width = 7, height = 5.5, dpi = 200)
+ggsave(paste0("vysledky/re_mem_u_map_", CRIME_SET, ".png"), p_u_re_mem, width = 7, height = 5.5, dpi = 200)
+```
+
+```{r}
+test_map <- units |>
+  left_join(test_cell, by = "id")
+
+plot_test <- function(col, title) {
+  ggplot(test_map |> filter(.data[[col]] > 0)) +
+    geom_sf(aes(fill = .data[[col]]), color = NA) +
+    geom_sf(data = prague, fill = NA, color = "black", linewidth = 0.3) +
+    scale_fill_viridis_c(option = "plasma", trans = "log10", name = "crimes\n2025") +
+    theme_void() +
+    labs(title = title)
+}
+
+plot_test("crime_count",   "Observed crime, 2025 (test)")
+plot_test("pred_rem_marg", "Predicted: RE NB + MEM (marginal)")
+plot_test("pred_rem_cond", "Predicted: RE NB + MEM (conditional)")
+```
+
+## 16. Seasonality
+
+Sezónnost se odhaduje na **celém panelu** (2016-01 až 2025-10), protože jde o popis a inferenci, ne o predikci. Všechny modely mají offset `log_days` (počet dní v měsíci). Efekt měsíce je pak rozdíl v **denní** intenzitě a únor tak nevychází nízko jen proto, že je kratší.
+
+### 16.1 Společný měsíční profil
+
+Model s fixním efektem buňky: sezónnost se měří **uvnitř buňky** a nemíchá se s tím, které buňky jsou kriminálnější. Leden je referenční měsíc.
+
+$$
+\log \mu_{it} = c_i + \sum_{m=2}^{12}\gamma_m \mathbb{1}[m(t)=m] + \delta_{y(t)} + \log(\text{days}_t)
+$$
+
+```{r}
+season_profile <- function(df, label) {
+  m <- fenegbin(
+    crime_count ~ i(month_num, ref = 1) + offset(log_days) | id + year_f,
+    data    = df,
+    cluster = ~id
+  )
+  ct <- as.data.frame(coeftable(m))
+  ct <- ct[grepl("^month_num::", rownames(ct)), ]
+  tibble(
+    group = label,
+    month = c(1L, as.integer(sub("month_num::", "", rownames(ct)))),
+    est   = c(0, ct$Estimate),
+    se    = c(0, ct$`Std. Error`)
+  ) |>
+    mutate(
+      irr  = exp(est),
+      low  = exp(est - 1.96 * se),
+      high = exp(est + 1.96 * se)
+    ) |>
+    structure(model = m)
+}
+
+prof_main <- season_profile(panel_df, CRIME_SET)
+m_season  <- attr(prof_main, "model")
+
+wald(m_season, "month_num")
+prof_main
+```
+
+```{r}
+p_season <- ggplot(prof_main, aes(month, irr)) +
+  geom_hline(yintercept = 1, linetype = 2, colour = "grey50") +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.2) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12) +
+  theme_minimal() +
+  labs(
+    title = "Seasonality of recorded crime (cell FE, per-day rate)",
+    x = "Month", y = "IRR relative to January"
+  )
+p_season
+ggsave(paste0("vysledky/sezonnost_", CRIME_SET, ".png"), p_season, width = 7, height = 4, dpi = 200)
+```
+
+### 16.2 Liší se sezónnost podle prostředí?
+
+Společný profil zachycují fixní efekty měsíce. Odchylku sezónní vlny buňky popisuje jedna harmonická dvojice $(\sin, \cos)$ s periodou 12 měsíců, jejíž amplituda a fáze závisí na charakteristikách buňky:
+
+$$
+\log \mu_{it} = c_i + \gamma_{m(t)} + \delta_{y(t)} + \big(x_i^\top a\big)\sin\tfrac{2\pi m}{12} + \big(x_i^\top b\big)\cos\tfrac{2\pi m}{12} + \log(\text{days}_t)
+$$
+
+Díky fixnímu efektu buňky je to čisté *within-cell* srovnání: statické $x_i$ samotné se odhadnout nedají, jejich interakce se sezónností ano. Ze stejného důvodu výsledek nezávisí na předpokladu RE.
+
+```{r}
+season_x <- c("n_pubs_500_z", "ghsl_mean_z", "clos_mean_z", "has_metro_500")
+
+m_season_het <- fenegbin(
+  as.formula(paste0(
+    "crime_count ~ (s1 + c1):(", paste(season_x, collapse = " + "),
+    ") + offset(log_days) | id + month_num + year_f"
+  )),
+  data    = panel_df,
+  cluster = ~id
+)
+
+etable(m_season_het)
+
+# společný test: závisí sezónní vlna na prostředí?
+wald(m_season_het, "^s1:|^c1:")
+```
+
+Predikovaný sezónní profil pro buňku s málo (−1 SD) a hodně (+1 SD) hospodami, ostatní proměnné na průměru:
+
+```{r}
+fe_month <- fixef(m_season_het)$month_num
+b <- coef(m_season_het)
+
+het_profile <- expand_grid(month = 1:12, pubs = c(-1, 1)) |>
+  mutate(
+    s1 = sin(2 * pi * month / 12),
+    c1 = cos(2 * pi * month / 12),
+    eta = fe_month[as.character(month)] +
+          pubs * (b["s1:n_pubs_500_z"] * s1 + b["c1:n_pubs_500_z"] * c1)
+  ) |>
+  group_by(pubs) |>
+  mutate(irr = exp(eta - eta[month == 1])) |>
+  ungroup() |>
+  mutate(pubs = factor(pubs, labels = c("few pubs (-1 SD)", "many pubs (+1 SD)")))
+
+p_season_pubs <- ggplot(het_profile, aes(month, irr, colour = pubs)) +
+  geom_hline(yintercept = 1, linetype = 2, colour = "grey50") +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12) +
+  theme_minimal() +
+  labs(
+    title = "Seasonal profile by pub density (within-cell)",
+    x = "Month", y = "IRR relative to January", colour = NULL
+  )
+p_season_pubs
+ggsave(paste0("vysledky/sezonnost_hospody_", CRIME_SET, ".png"), p_season_pubs, width = 7, height = 4, dpi = 200)
+```
+
+Amplituda a vrchol odchylky sezónní vlny na +1 SD proměnné ($A = \sqrt{a^2 + b^2}$, vrchol v měsíci $\tfrac{12}{2\pi}\operatorname{atan2}(a, b)$):
+
+```{r}
+tibble(
+  var = season_x,
+  a   = b[paste0("s1:", season_x)],
+  b   = b[paste0("c1:", season_x)]
+) |>
+  mutate(
+    amplitude  = sqrt(a^2 + b^2),
+    peak_month = (atan2(a, b) * 12 / (2 * pi)) %% 12,
+    peak_month = ifelse(peak_month == 0, 12, peak_month)
+  )
+```
+
+### 16.3 Sezónnost podle kategorií činu
+
+Stejný model jako v 16.1, odhadnutý zvlášť pro každou kategorii. Kategorie se mohou překrývat, protože jeden delikt může mít více tříd.
+
+```{r}
+panel_skeleton <- panel_df |>
+  dplyr::select(id, key, year, month_num, year_f, log_days)
+
+profiles_group <- bind_rows(lapply(SEASON_GROUPS, function(g) {
+  df_g <- panel_skeleton |>
+    left_join(
+      crime_counts_group |> filter(group == g) |> dplyr::select(-group),
+      by = c("key", "year", "month_num" = "month")
+    ) |>
+    mutate(crime_count = replace_na(crime_count, 0L))
+  season_profile(df_g, g)
+}))
+
+p_season_groups <- ggplot(profiles_group, aes(month, irr, colour = group, fill = group)) +
+  geom_hline(yintercept = 1, linetype = 2, colour = "grey50") +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.15, colour = NA) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12) +
+  theme_minimal() +
+  labs(
+    title = "Seasonality by crime category (cell FE, per-day rate)",
+    x = "Month", y = "IRR relative to January", colour = NULL, fill = NULL
+  )
+p_season_groups
+ggsave("vysledky/sezonnost_kategorie.png", p_season_groups, width = 7, height = 4, dpi = 200)
+```
+
+### 16.4 Vlastní sezónnost každé buňky (random slopes)
+
+Jen pokud `RUN_SEASON_RS = TRUE` (v rychlém režimu se přeskakuje).
+
+Rozšíření RE modelu: každá buňka má kromě náhodného interceptu i náhodnou amplitudu a fázi sezónní vlny, $(u_{0i}, u_{si}, u_{ci}) \sim N(0, \Sigma)$. Likelihood-ratio test proti modelu jen s náhodným interceptem říká, zda se sezónnost mezi buňkami liší víc, než vysvětlí regresory.
+
+```{r eval=RUN_SEASON_RS}
+rhs_season <- paste("crime_count ~", rhs_x, "+ month + year_f + offset(pop_offset + log_days)")
+
+m_re_panel <- cached(paste0("m_re_panel_", CRIME_TAG), glmmTMB(
+  as.formula(paste(rhs_season, "+ (1 | id_f)")),
+  data = panel_df, family = nbinom2
+))
+
+m_re_season <- cached(paste0("m_re_season_", CRIME_TAG), glmmTMB(
+  as.formula(paste(rhs_season, "+ (1 + s1 + c1 | id_f)")),
+  data = panel_df, family = nbinom2
+))
+
+VarCorr(m_re_season)
+anova(m_re_panel, m_re_season)
+```
+
+LR test je u rozptylových parametrů konzervativní (nulová hypotéza leží na hranici parametrického prostoru), takže skutečná p-hodnota je ještě nižší.
+
+```{r eval=RUN_SEASON_RS}
+u_season <- ranef(m_re_season)$cond$id_f
+u_season <- u_season[as.character(static_vars$id), ]
+
+hex_season <- units |>
+  mutate(
+    amp  = sqrt(u_season$s1^2 + u_season$c1^2),
+    peak = (atan2(u_season$s1, u_season$c1) * 12 / (2 * pi)) %% 12
+  )
+
+p_amp <- ggplot(hex_season) +
+  geom_sf(aes(fill = amp), colour = NA) +
+  geom_sf(data = prague, fill = NA, colour = "black", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "magma", name = "amplitude\n(log scale)") +
+  theme_void() +
+  labs(title = "Unit-specific deviation from common seasonality")
+p_amp
+ggsave(paste0("vysledky/sezonnost_amplituda_", CRIME_SET, ".png"), p_amp, width = 7, height = 5.5, dpi = 200)
+
+# Je odchylná sezónnost prostorově shluknutá?
+moran_cells(hex_season$amp)
+```
