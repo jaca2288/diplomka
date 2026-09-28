@@ -13,3 +13,8 @@ figure/
 .RData
 .Rproj.user/
 .DS_Store
+
+# logy stahování
+ntl/*.log
+ntl/start.txt
+Rplots.pdf

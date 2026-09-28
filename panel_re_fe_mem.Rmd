@@ -15,7 +15,9 @@ Navazuje na `panel_fe_mem.Rmd`. Stejná data a MEM filtr, navíc:
 * přibyly modely s **náhodnými efekty buňky** (`glmmTMB`) a s **fixními efekty buňky** (`fenegbin | id`),
 * mezivýsledky se ukládají do `cache/`, takže se 2,6 GB GeoJSON a OSM stahují jen jednou,
 * data jsou omezena na **trestné činy** podle číselníku (bez přestupků), na místo spáchání a bez skutků, které se nestaly,
-* sezónnost: společný měsíční profil, rozdíly sezónnosti podle prostředí a sezónní profily podle kategorií činu.
+* sezónnost: společný měsíční profil, rozdíly sezónnosti podle prostředí a sezónní profily podle kategorií činu,
+* GHSL rozložen na obytnou a nebytovou zástavbu (vrstva NRES),
+* časově proměnné regresory: noční světla NASA Black Marble (měsíčně), hospody z historie OSM (ohsome, měsíčně), populace městských částí ČSÚ rozpočítaná do jednotek a rozložená na měsíce (Denton), turisté v Praze (ČSÚ, měsíčně) v interakci s hospodami; Mundlakův test FE vs RE.
 
 ## 0. Packages
 
@@ -39,6 +41,9 @@ library(MASS, exclude = "select")
 library(modelsummary)
 library(ggplot2)
 library(jsonlite)
+library(httr2)
+library(tempdisagg)
+library(RCzechia)
 ```
 
 ## 1. Settings and cache
@@ -47,6 +52,9 @@ library(jsonlite)
 setwd("/Users/jachym.bielesz/diplomka")
 
 GHSL_FILE  <- "ghsl/GHS_BUILT_S_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif"
+GHSL_NRES_FILE <- "ghsl/GHS_BUILT_S_NRES_E2018_GLOBE_R2023A_54009_10_V1_0_R4_C20.tif"
+POP_MC_FILE  <- "csu/CR_L3_MC.xlsx"   # ČSÚ: obyvatelstvo Prahy podle městských částí 1991–2025
+TOURISM_FILE <- "csu/CRU02M.csv"      # ČSÚ: návštěvnost HUZ, měsíčně, kraje
 POP_FILE   <- "worldpop/cze_pop_2015_CN_100m_R2025A_v1.tif"
 CRIME_FILE <- "kriminalita_geojson/crimes_prague.geojson"
 
@@ -65,6 +73,9 @@ BUFFER_M   <- 500
 COORD_DIGITS <- 6             # zaokrouhlení souřadnic při párování činů s anonymizačními body
 
 UNIT_TAG <- if (UNIT == "h3") paste0("h3res", RES_H3) else "vor"
+
+# Verze specifikace regresorů: při změně regresorů zvýšit, aby se nenačetly staré modely z cache
+SPEC <- "v3"
 
 # Výběr deliktů (kódy z ciselniky/types.json; seznam typů deliktu obsahuje i nadřazené kódy)
 CRIME_SETS <- list(
@@ -164,7 +175,7 @@ crimes <- crimes_all |>
   filter(base_keep, has_code(types_list, CRIME_SETS[[CRIME_SET]]))
 
 # tag do názvů cache: jiný výběr deliktů = jiné modely
-CRIME_TAG <- paste0(CRIME_SET, "_", YEAR_MIN, "_", UNIT_TAG)
+CRIME_TAG <- paste0(CRIME_SET, "_", YEAR_MIN, "_", UNIT_TAG, "_", SPEC)
 
 c(all_records = nrow(crimes_all), kept = nrow(crimes))
 
@@ -280,6 +291,8 @@ count(crime_counts_group, group, wt = crime_count)
 
 ### 5.1 GHSL and WorldPop
 
+GHSL (rok 2018, 10 m) udává zastavěnou plochu v m² na pixel 10×10 m, tedy podíl zastavění v %. Vrstva NRES je v 10 m **binární**: 1 = zástavba pixelu má převážně nebytové využití (kanceláře, obchody, průmysl, dopravní stavby). Nebytová zastavěná plocha pixelu je proto celková × NRES, obytná celková × (1 − NRES). Obě se pak zprůměrují přes jednotku, takže `ghsl_res_mean + ghsl_nres_mean = ghsl_mean`.
+
 ```{r}
 r <- rast(GHSL_FILE)
 names(r) <- "ghsl"
@@ -287,15 +300,25 @@ names(r) <- "ghsl"
 # (malé polygony v centru pokrývají jen pár pixelů WorldPop 100 m)
 ghsl_vals <- terra::extract(r, vect(st_transform(units, crs(r))), fun = mean, na.rm = TRUE, exact = TRUE)
 
+# dlaždice má 100 000 × 100 000 pixelů -> nejdřív oříznout na Prahu
+prague_ext <- ext(vect(st_transform(prague, crs(r)))) + 1000
+r_nres <- crop(r, prague_ext) * crop(rast(GHSL_NRES_FILE), prague_ext)
+names(r_nres) <- "ghsl_nres"
+nres_vals <- terra::extract(r_nres, vect(st_transform(units, crs(r_nres))), fun = mean, na.rm = TRUE, exact = TRUE)
+
 pop_r <- rast(POP_FILE)
 names(pop_r) <- "population"
 pop_vals <- terra::extract(pop_r, vect(st_transform(units, crs(pop_r))), fun = sum, na.rm = TRUE, exact = TRUE)
 
 static_raster <- tibble(
   id         = units$id,
-  ghsl_mean  = ghsl_vals$ghsl,
-  population = replace_na(pop_vals$population, 0)
+  ghsl_mean      = ghsl_vals$ghsl,
+  ghsl_nres_mean = nres_vals$ghsl_nres,
+  ghsl_res_mean  = ghsl_vals$ghsl - nres_vals$ghsl_nres,
+  population     = replace_na(pop_vals$population, 0)
 )
+
+summary(static_raster[, c("ghsl_mean", "ghsl_res_mean", "ghsl_nres_mean")])
 ```
 
 ### 5.2 OSM: streets, pubs, metro
@@ -457,7 +480,7 @@ Voroného polygony mají velmi různou plochu (v centru desítky arů, na okraji
 Regresory se standardizují (z-skóre přes jednotky). Koeficient pak znamená změnu log(μ) při zvýšení proměnné o 1 směrodatnou odchylku a `exp(beta)` je incidence rate ratio (IRR) na 1 SD. Díky tomu jsou koeficienty srovnatelné a `glmmTMB` lépe konverguje. `has_metro_500` zůstává 0/1.
 
 ```{r}
-x_vars <- c("ghsl_mean", "clos_mean", "eig_mean", "deg_mean", "n_pubs_500")
+x_vars <- c("ghsl_res_mean", "ghsl_nres_mean", "clos_mean", "eig_mean", "deg_mean", "n_pubs_500")
 if (UNIT == "voronoi") x_vars <- c(x_vars, "log_area")
 
 static_vars <- static_vars |>
@@ -468,14 +491,281 @@ x_z <- c(paste0(x_vars, "_z"), "has_metro_500")
 round(cor(static_vars[, x_z]), 2)
 ```
 
+### 5.6 Time-varying regressors
+
+Všechny ostatní regresory jsou statické. Následující tři se skutečně měří v čase, takže je lze odhadnout i uvnitř jednotky (FE) a použít Mundlakův test (sekce 10.8).
+
+**Hospody z historie OSM.** [ohsome API](https://api.ohsome.org) vrací stav OpenStreetMap k libovolnému datu. Pro každou jednotku se spočítá počet hospod, barů, restaurací a kaváren v okruhu 500 m k 1. dni každého měsíce. Pozor: růst v OSM je zčásti doplňování mapy, ne otevírání podniků (v centru Prahy +55 % mezi 2016 a 2025, nejvíc do 2019). Společný růst za celou Prahu pohltí fixní efekty roku, rozdílné tempo mapování mezi oblastmi ale zůstává chybou měření.
+
+```{r}
+ohsome_monthly <- function(polys, filter, time, chunk = 100) {
+  bind_rows(lapply(split(seq_len(nrow(polys)), ceiling(seq_len(nrow(polys)) / chunk)), function(idx) {
+    tf <- tempfile(fileext = ".geojson")
+    st_write(polys[idx, ], tf, driver = "GeoJSON", quiet = TRUE, layer_options = "ID_FIELD=id")
+    resp <- request("https://api.ohsome.org/v1/elements/count/groupBy/boundary") |>
+      req_body_form(bpolys = paste(readLines(tf), collapse = ""), time = time, filter = filter) |>
+      req_timeout(600) |>
+      req_retry(max_tries = 5) |>
+      req_perform()
+    res <- fromJSON(resp_body_string(resp), simplifyVector = FALSE)$groupByResult
+    bind_rows(lapply(res, function(g) tibble(
+      id    = as.integer(g$groupByObject),
+      date  = as.Date(substr(vapply(g$result, `[[`, "", "timestamp"), 1, 10)),
+      value = vapply(g$result, function(r) as.numeric(r$value), 0)
+    )))
+  }))
+}
+
+pubs_tv <- cached(paste0("ohsome_pubs_", UNIT_TAG, "_", YEAR_MIN), {
+  buf <- units_m |>
+    st_buffer(BUFFER_M) |>
+    st_simplify(dTolerance = 20) |>
+    st_transform(4326) |>
+    dplyr::select(id)
+  ohsome_monthly(
+    buf,
+    filter = "amenity in (pub, bar, restaurant, cafe) and (type:node or type:way)",
+    time   = paste0(YEAR_MIN, "-01-01/", LAST_MONTH, "/P1M")
+  )
+}) |>
+  transmute(id, year = year(date), month = month(date), pubs_t = value)
+
+pubs_tv |>
+  group_by(year) |>
+  summarise(mean_pubs = mean(pubs_t), .groups = "drop")
+```
+
+**Populace.** ČSÚ zveřejňuje počet obyvatel 57 městských částí k 1. 1. každého roku. Postup:
+
+1. Roční řada každé MČ se rozloží na měsíce metodou **Denton–Cholette** (`tempdisagg`, `conversion = "first"`): stav k 1. 1. se zachová přesně a mezi roky vznikne co nejhladší průběh.
+2. Měsíční počet obyvatel MČ se rozdělí do jednotek podle rozložení WorldPop (**dasymetrické rozdělení**): jednotka dostane podíl MČ úměrný počtu obyvatel WorldPop v průniku jednotky a MČ.
+
+Stav k 1. 1. 2021 zahrnuje výsledky sčítání 2021, takže řada má zlom (např. Praha 1 −13 % za jediný den). Roky před 2021 se proto přepočítají koeficientem (stav 1. 1. 2021) / (stav 31. 12. 2020) dané MČ, aby řada navazovala.
+
+```{r}
+mc <- cached("praha_mc", casti() |> filter(NAZ_OBEC == "Praha"))
+
+pop_mc <- {
+  d <- as.data.frame(readxl::read_excel(POP_MC_FILE, sheet = 1, col_names = FALSE, .name_repair = "minimal"))
+  hdr <- gsub("\\s+", " ", unlist(d[5, ]))
+  name_col <- which(apply(d, 2, function(col) any(col %in% "Praha 1")))[1]
+  rows <- which(trimws(d[[name_col]]) %in% mc$NAZEV)
+  stopifnot(length(rows) == nrow(mc))
+  nazev <- trimws(d[[name_col]][rows])
+  col_of <- function(pattern) grep(pattern, hdr)
+
+  jan1 <- col_of("^stav 1\\.1\\.\\d{4}")
+  yrs  <- as.integer(sub("^stav 1\\.1\\.(\\d{4}).*", "\\1", hdr[jan1]))
+  last <- col_of("^stav 31\\.12\\.2025")   # stav 31. 12. 2025 = 1. 1. 2026
+
+  out <- bind_rows(
+    lapply(seq_along(jan1), function(k) tibble(nazev, year = yrs[k], pop = as.numeric(d[[jan1[k]]][rows]))),
+    tibble(nazev, year = 2026L, pop = as.numeric(d[[last]][rows]))
+  )
+
+  # zlom sčítání 2021: navázání starší části řady
+  k2021 <- tibble(
+    nazev,
+    k = as.numeric(d[[col_of("^stav 1\\.1\\.2021")]][rows]) /
+        as.numeric(d[[col_of("^stav 31\\.12\\.2020")]][rows])
+  )
+  out |>
+    left_join(k2021, by = "nazev") |>
+    mutate(pop = if_else(year <= 2020, pop * k, pop)) |>
+    dplyr::select(-k)
+}
+
+pop_mc_monthly <- pop_mc |>
+  filter(year >= YEAR_MIN) |>
+  group_by(nazev) |>
+  group_modify(function(x, key) {
+    x <- arrange(x, year)
+    a <- ts(x$pop, start = min(x$year), frequency = 1)
+    m <- predict(td(a ~ 1, to = 12, method = "denton-cholette", conversion = "first"))
+    tibble(year = as.integer(floor(time(m) + 1e-6)), month = as.integer(cycle(m)), pop_mc = as.numeric(m))
+  }) |>
+  ungroup()
+
+# dasymetrické váhy: podíl WorldPop průniku jednotka × MČ na WorldPop celé MČ
+# průnik může vytvořit i čáry/body na společných hranicích -> ponechat jen plochy
+pieces <- st_intersection(
+  units_m |> dplyr::select(id),
+  st_transform(mc, CRS_M) |> dplyr::select(nazev = NAZEV)
+) |>
+  st_collection_extract("POLYGON")
+pieces$wp <- terra::extract(pop_r, vect(st_transform(pieces, crs(pop_r))),
+                            fun = sum, na.rm = TRUE, exact = TRUE)$population
+pieces <- st_drop_geometry(pieces) |>
+  mutate(wp = replace_na(wp, 0)) |>
+  group_by(nazev) |>
+  mutate(share = wp / sum(wp)) |>
+  ungroup()
+
+pop_tv <- pieces |>
+  dplyr::select(id, nazev, share) |>
+  inner_join(pop_mc_monthly, by = "nazev", relationship = "many-to-many") |>
+  group_by(id, year, month) |>
+  summarise(pop_t = sum(share * pop_mc), .groups = "drop")
+
+# jednotky mimo RÚIAN hranici Prahy (okrajové proužky kvůli hranici z OSM) nemají obyvatele
+c(units_without_mc = sum(!static_vars$id %in% pop_tv$id))
+
+# kontrola: součet přes jednotky = součet MČ
+pop_tv |> filter(month == 1) |> group_by(year) |> summarise(units = sum(pop_t)) |>
+  left_join(pop_mc |> group_by(year) |> summarise(mc = sum(pop)), by = "year")
+```
+
+**Turisté.** Počet hostů v hromadných ubytovacích zařízeních v Praze za měsíc (ČSÚ). Je to jedna řada pro celou Prahu, takže její samotný efekt téměř pohltí fixní efekty roku a měsíce. Identifikovatelná a zajímavá je **interakce s hospodami**: roste kriminalita s turisty víc v oblastech s hospodami?
+
+```{r}
+tourism <- read.csv(TOURISM_FILE, encoding = "UTF-8") |>
+  filter(Ukazatel == "Počet hostů", REZIDENCE == 0, KATHUZ == 1, Uz02 == "CZ010") |>
+  transmute(
+    year   = as.integer(substr(CasM, 1, 4)),
+    month  = as.integer(substr(CasM, 6, 7)),
+    guests = as.numeric(Hodnota)
+  )
+
+tourism |> filter(year >= YEAR_MIN) |> summarise(from = min(year * 100 + month), to = max(year * 100 + month), mean_guests = mean(guests))
+```
+
+**Přítomné osoby z mobilních dat (kamdojizdime.cz).** Portál MV zveřejňuje pro každou obec průměrný počet přítomných osob v každé hodině týdne, podle dat všech tří mobilních operátorů, ve 4 měřeních po 28 dnech. Podle [metodiky](https://www.kamdojizdime.cz/content/pages/179_vystupy-projektu/modules/files/29_metodicky-postup-reseni-2.pdf):
+
+| měření | dny vybrané z | typ |
+|---|---|---|
+| podzim 2021 | září–říjen 2021 | typické dny (bez svátků a prázdnin) |
+| jaro 2022 | březen–červen 2022 | typické dny |
+| léto 2022 | červenec–srpen 2022 | letní prázdniny |
+| zima 2022/23 | zimní měsíce | zimní svátky |
+
+Data jsou za celou obec, takže pro Prahu je to jedna hodnota za měření. Čtyři hodnoty se proloží **periodickým kubickým splinem** (prosinec navazuje na leden) a dostane se index přítomnosti pro každý kalendářní měsíc, který se použije pro všechny roky panelu. Jde tedy o **sezónní profil přítomnosti**, ne o vývoj mezi roky. Index je funkcí měsíce, takže jeho samostatný efekt je totožný s fixními efekty měsíce. Identifikovat lze jen **interakce** s vlastnostmi jednotek.
+
+Návštěvníci jsou v datech jen v řádu tisíců: data zachycují SIM karty českých operátorů, zahraniční turisté s roamingem v nich téměř chybí. Proto se používá celkový počet přítomných a turisté z ČSÚ zůstávají samostatnou proměnnou.
+
+```{r}
+KDJ_CITY    <- 554782   # kód obce Praha
+KDJ_PERIODS <- tibble(
+  period = 1:4,
+  label  = c("podzim 2021", "jaro 2022", "léto 2022", "zima 2022/23"),
+  month_center = c(9.5, 4.5, 7.5, 1)   # střed měsíců, ze kterých byly dny vybrány
+)
+
+# Stažení přes stejné rozhraní, které používá webový portál (vyžaduje session cookie)
+kdj_fetch <- function(city, period) {
+  f <- file.path("kamdojizdime", sprintf("city%s_period%s.json", city, period))
+  if (!file.exists(f)) {
+    dir.create("kamdojizdime", showWarnings = FALSE)
+    jar <- tempfile()
+    request("https://www.kamdojizdime.cz/portal-geolokacnich-dat") |>
+      req_cookie_preserve(jar) |> req_perform()
+    request("https://www.kamdojizdime.cz/portal-geolokacnich-dat") |>
+      req_url_query(do = "loadData", city = city, period = period) |>
+      req_headers(`X-Requested-With` = "XMLHttpRequest", Accept = "application/json") |>
+      req_cookie_preserve(jar) |>
+      req_perform(path = f)
+  }
+  daily <- fromJSON(f)$graphData$daily
+  cats  <- setdiff(names(daily), "labels")
+  tibble(period = period, category = cats,
+         mean_present = vapply(cats, function(k) mean(daily[[k]]$data), 0))
+}
+
+kdj <- bind_rows(lapply(KDJ_PERIODS$period, function(p) kdj_fetch(KDJ_CITY, p))) |>
+  left_join(KDJ_PERIODS, by = "period")
+
+kdj |>
+  dplyr::select(label, category, mean_present) |>
+  tidyr::pivot_wider(names_from = category, values_from = mean_present)
+
+kdj_total <- kdj |>
+  group_by(period, label, month_center) |>
+  summarise(present = sum(mean_present), .groups = "drop") |>
+  arrange(month_center)
+
+# periodický spline přes 12 měsíců (log škála, relativně k průměru)
+spl <- splinefun(
+  x = c(kdj_total$month_center, kdj_total$month_center[1] + 12),
+  y = c(log(kdj_total$present), log(kdj_total$present[1])),
+  method = "periodic"
+)
+presence <- tibble(month = 1:12, log_present = spl(1:12)) |>
+  mutate(log_present = log_present - mean(log_present))
+
+ggplot(presence, aes(month, exp(log_present))) +
+  geom_line() +
+  geom_point() +
+  geom_point(data = mutate(kdj_total, rel = present / exp(mean(spl(1:12)))),
+             aes(month_center, rel), colour = "red", size = 3) +
+  scale_x_continuous(breaks = 1:12) +
+  theme_minimal() +
+  labs(title = "Prague: people present relative to annual mean (mobile data, spline)",
+       x = "Month", y = "Relative presence")
+```
+
+
+**Noční světla (NASA Black Marble VNP46A3).** Měsíční kompozit jasu nočních světel ze satelitu VIIRS (vrstva `NearNadir_Composite_Snow_Free`, nW·cm⁻²·sr⁻¹), rozlišení 15″ ≈ 300 × 460 m. Je to proxy lidské aktivity v noci, která se skutečně měří každý měsíc. Stažení a oříznutí na Prahu dělá samostatný skript `ntl_download.R` (jednorázově, trvá desítky minut). Notebook načítá jen hotové výřezy z `ntl/`.
+
+Omezení: přechod veřejného osvětlení na LED mění jas nezávisle na aktivitě, v zimě bývají měsíce s oblačností nebo sněhem méně spolehlivé a pixel je srovnatelně velký s polygonem v centru.
+
+```{r}
+ntl_files <- sprintf("ntl/prague_%d_%02d.tif", time_index$year, time_index$month)
+if (!all(file.exists(ntl_files))) {
+  stop("Chybí výřezy nočních světel – spusť: Rscript ntl_download.R ",
+       sprintf("%d-%02d", time_index$year[1], time_index$month[1]), " ",
+       sprintf("%d-%02d", tail(time_index$year, 1), tail(time_index$month, 1)))
+}
+
+ntl_stack <- rast(ntl_files)
+names(ntl_stack) <- sprintf("m%d_%02d", time_index$year, time_index$month)
+
+ntl_vals <- terra::extract(ntl_stack, vect(st_transform(units, crs(ntl_stack))),
+                           fun = mean, na.rm = TRUE, exact = TRUE)
+
+ntl_tv <- as_tibble(ntl_vals) |>
+  mutate(id = units$id) |>
+  dplyr::select(-ID) |>
+  tidyr::pivot_longer(-id, names_to = "ym", values_to = "ntl_t") |>
+  mutate(
+    year  = as.integer(substr(ym, 2, 5)),
+    month = as.integer(substr(ym, 7, 8)),
+    ntl_t = ifelse(is.nan(ntl_t), NA_real_, ntl_t)
+  ) |>
+  dplyr::select(id, year, month, ntl_t)
+
+# chybějící měsíce (oblačnost/sníh) doplnit průměrem jednotky, počet uvést
+c(missing_unit_months = sum(is.na(ntl_tv$ntl_t)), share = mean(is.na(ntl_tv$ntl_t)))
+ntl_tv <- ntl_tv |>
+  group_by(id) |>
+  mutate(ntl_t = ifelse(is.na(ntl_t), mean(ntl_t, na.rm = TRUE), ntl_t)) |>
+  ungroup()
+
+ntl_tv |>
+  group_by(year, month) |>
+  summarise(mean_ntl = mean(ntl_t), .groups = "drop") |>
+  ggplot(aes(make_date(year, month, 1), mean_ntl)) +
+  geom_line() +
+  theme_minimal() +
+  labs(title = "Mean night-time radiance over Prague units (VNP46A3)",
+       x = NULL, y = "nW/cm²/sr")
+```
+
 ## 6. Panel data
 
 ```{r}
 panel_df <- expand_grid(id = static_vars$id, time_index) |>
   left_join(static_vars, by = "id") |>
   left_join(crime_counts_month, by = c("key", "year", "month")) |>
+  left_join(pubs_tv,  by = c("id", "year", "month")) |>
+  left_join(pop_tv,   by = c("id", "year", "month")) |>
+  mutate(pop_t = replace_na(pop_t, 0)) |>
+  left_join(tourism,  by = c("year", "month")) |>
+  left_join(presence, by = "month") |>
+  left_join(ntl_tv,   by = c("id", "year", "month")) |>
   mutate(
     crime_count = replace_na(crime_count, 0L),
+    log_pop_t   = log(pop_t + 1),
+    log_guests  = log(guests),
+    log_ntl_t   = log1p(ntl_t),
     trend       = (year - YEAR_MIN) + (month - 1) / 12,
     month_num   = month,
     year_f      = factor(year),
@@ -486,7 +776,10 @@ panel_df <- expand_grid(id = static_vars$id, time_index) |>
     id_f        = factor(id)
   )
 
-stopifnot(nrow(panel_df) == nrow(static_vars) * nrow(time_index))
+stopifnot(
+  nrow(panel_df) == nrow(static_vars) * nrow(time_index),
+  !anyNA(panel_df$pubs_t), !anyNA(panel_df$pop_t), !anyNA(panel_df$guests), !anyNA(panel_df$ntl_t)
+)
 
 c(
   n_units  = n_distinct(panel_df$id),
@@ -777,6 +1070,115 @@ m_fe_decomp <- feols(
 )
 ```
 
+### 10.8 Time-varying regressors: FE, Mundlak and the Hausman-type test
+
+Hospody, populace a noční světla se mění v čase, proto lze jejich efekt rozložit (Mundlak 1978):
+
+$$
+\log \mu_{it} = \beta_W\, z_{it} + \pi\, \bar z_i + x_i^\top\beta + \dots + u_i ,
+\qquad \beta_B = \beta_W + \pi
+$$
+
+* $\beta_W$ (**within**): o kolik se změní kriminalita v jednotce, když v ní přibydou hospody nebo obyvatelé. Stejný koeficient odhaduje FE model.
+* $\beta_B$ (**between**): o kolik se liší jednotky s trvale více hospodami. To je to, co odhaduje RE model se statickou proměnnou.
+* **Test $H_0: \pi = 0$** je regresní verze Hausmanova testu. Pokud $\pi \ne 0$, náhodný efekt $u_i$ souvisí s regresorem a RE odhad by byl zkreslený. Mundlakova specifikace přitom zůstává konzistentní i tak.
+
+Průměry $\bar z_i$ se počítají z trénovacích dat. Hospody jsou škálované stejně pro $z_{it}$ i $\bar z_i$ (na 1 SD průměru přes jednotky), aby šly $\beta_W$ a $\beta_B$ přímo porovnat. Populace je v logaritmu, koeficient je elasticita. Turisté jsou standardizovaný log počtu hostů.
+
+```{r}
+tv_means <- train_df |>
+  group_by(id) |>
+  summarise(pubs_bar = mean(pubs_t), lpop_bar = mean(log_pop_t), lntl_bar = mean(log_ntl_t), .groups = "drop")
+
+pubs_center <- mean(tv_means$pubs_bar)
+pubs_scale  <- sd(tv_means$pubs_bar)
+guests_mu   <- mean(train_df$log_guests)
+guests_sd   <- sd(train_df$log_guests)
+presence_sd <- sd(presence$log_present)
+
+add_tv <- function(df) {
+  df |>
+    left_join(tv_means, by = "id") |>
+    mutate(
+      pubs_tz    = (pubs_t   - pubs_center) / pubs_scale,
+      pubs_bar_z = (pubs_bar - pubs_center) / pubs_scale,
+      guests_z   = (log_guests - guests_mu) / guests_sd,
+      # interakce jako vlastní proměnná: glmmTMB a fixest by jinak pojmenovaly člen různě
+      guests_x_pubs = guests_z * pubs_bar_z,
+      # sezónní přítomnost lidí (mobilní data) × vlastnosti jednotky; samotný index = efekt měsíce
+      presence_z     = log_present / presence_sd,
+      pres_x_pubs    = presence_z * pubs_bar_z,
+      pres_x_nres    = presence_z * ghsl_nres_mean_z,
+      pres_x_res     = presence_z * ghsl_res_mean_z
+    )
+}
+train_df <- add_tv(train_df)
+test_df  <- add_tv(test_df)
+
+# statické regresory bez hospod (ty jsou nyní časově proměnné)
+rhs_static <- paste(setdiff(x_z, "n_pubs_500_z"), collapse = " + ")
+
+m_cre <- cached(paste0("m_cre_", CRIME_TAG), glmmTMB(
+  as.formula(paste(
+    "crime_count ~", rhs_static, "+ pubs_tz + pubs_bar_z + log_pop_t + lpop_bar + log_ntl_t + lntl_bar +",
+    "guests_z + guests_x_pubs + pres_x_pubs + pres_x_nres + pres_x_res +", rhs_mem,
+    "+ month + year_f + (1 | id_f)"
+  )),
+  data = train_df, family = nbinom2,
+  # s ~90 parametry nestačí výchozí limit iterací optimalizátoru
+  control = glmmTMBControl(optCtrl = list(iter.max = 2000, eval.max = 2000))
+))
+
+m_fe_tv <- fenegbin(
+  crime_count ~ pubs_tz + log_pop_t + log_ntl_t + guests_z + guests_x_pubs +
+    pres_x_pubs + pres_x_nres + pres_x_res | id + month + year_f,
+  data    = train_df,
+  cluster = ~id
+)
+
+tv_terms <- c("pubs_tz", "pubs_bar_z", "log_pop_t", "lpop_bar", "log_ntl_t", "lntl_bar", "guests_z", "guests_x_pubs",
+              "pres_x_pubs", "pres_x_nres", "pres_x_res")
+cre_ct <- summary(m_cre)$coefficients$cond[tv_terms, ]
+round(cre_ct, 4)
+etable(m_fe_tv)
+```
+
+Within efekt z Mundlakova RE modelu a z FE modelu by měl vyjít podobně (oba se identifikují jen ze změn uvnitř jednotky):
+
+```{r}
+cmp_terms <- c("pubs_tz", "log_pop_t", "log_ntl_t", "guests_x_pubs", "pres_x_pubs", "pres_x_nres", "pres_x_res")
+tibble(
+  term    = c("pubs (within)", "log pop (within)", "log night lights (within)", "guests x pubs",
+              "presence x pubs", "presence x non-res", "presence x res"),
+  CRE     = cre_ct[cmp_terms, 1],
+  CRE_se  = cre_ct[cmp_terms, 2],
+  FE      = coef(m_fe_tv)[cmp_terms],
+  FE_se   = se(m_fe_tv)[cmp_terms]
+)
+```
+
+Mundlakův (Hausmanův) test a between efekty $\beta_B = \beta_W + \pi$:
+
+```{r}
+b_cre <- fixef(m_cre)$cond
+V_cre <- vcov(m_cre)$cond
+
+pi_terms <- c("pubs_bar_z", "lpop_bar", "lntl_bar")
+chi2 <- as.numeric(t(b_cre[pi_terms]) %*% solve(V_cre[pi_terms, pi_terms]) %*% b_cre[pi_terms])
+c(chi2 = chi2, df = length(pi_terms), p_value = pchisq(chi2, length(pi_terms), lower.tail = FALSE))
+
+lin_comb <- function(a, b) {
+  est <- b_cre[a] + b_cre[b]
+  se  <- sqrt(V_cre[a, a] + V_cre[b, b] + 2 * V_cre[a, b])
+  c(estimate = unname(est), se = unname(se))
+}
+rbind(
+  pubs_between    = lin_comb("pubs_tz", "pubs_bar_z"),
+  log_pop_between = lin_comb("log_pop_t", "lpop_bar"),
+  log_ntl_between = lin_comb("log_ntl_t", "lntl_bar")
+)
+```
+
 ## 11. Results
 
 ```{r}
@@ -805,7 +1207,8 @@ models_main <- list(
 if (RUN_ESF) models_main <- append(models_main, list("RE-ESF NB" = m_nb_esf), after = 4)
 
 coef_map <- c(
-  ghsl_mean_z   = "GHSL built-up (SD)",
+  ghsl_res_mean_z  = "GHSL residential built-up (SD)",
+  ghsl_nres_mean_z = "GHSL non-residential built-up (SD)",
   clos_mean_z   = "Closeness (SD)",
   eig_mean_z    = "Eigenvector (SD)",
   deg_mean_z    = "Degree (SD)",
@@ -1119,7 +1522,7 @@ $$
 Díky fixnímu efektu buňky je to čisté *within-cell* srovnání: statické $x_i$ samotné se odhadnout nedají, jejich interakce se sezónností ano. Ze stejného důvodu výsledek nezávisí na předpokladu RE.
 
 ```{r}
-season_x <- c("n_pubs_500_z", "ghsl_mean_z", "clos_mean_z", "has_metro_500")
+season_x <- c("n_pubs_500_z", "ghsl_res_mean_z", "ghsl_nres_mean_z", "clos_mean_z", "has_metro_500")
 
 m_season_het <- fenegbin(
   as.formula(paste0(
